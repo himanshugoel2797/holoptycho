@@ -365,10 +365,7 @@ class PtychoRecon(Operator):
         sys.stderr.flush()
         
 # Module-level writer — initialized once when the pipeline starts.
-# Uses TiledWriter if TILED_BASE_URL + TILED_API_KEY are set, otherwise
-# falls back to .npy file writes.
-# NOTE: The .npy fallback is deprecated and will be removed in a future release.
-#       Set TILED_BASE_URL and TILED_API_KEY to use the Tiled backend.
+# Requires TILED_BASE_URL and TILED_API_KEY; raises RuntimeError otherwise.
 _writer = get_writer()
 
 @create_op(inputs="results")

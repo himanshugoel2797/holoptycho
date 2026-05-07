@@ -62,7 +62,30 @@ _SIGKILL_TIMEOUT = 5.0
 # Race window in start() for any lingering subprocess from a prior /stop.
 _STARTUP_RACE_TIMEOUT = 30.0
 
-_REQUIRED_ENV_VARS = ("SERVER_STREAM_SOURCE", "PANDA_STREAM_SOURCE")
+_REQUIRED_ENV_VARS = (
+    "SERVER_STREAM_SOURCE",
+    "PANDA_STREAM_SOURCE",
+    "TILED_BASE_URL",
+)
+
+
+def check_required_env() -> None:
+    """Raise ``RuntimeError`` if any required env var is unset.
+
+    Called both at API import (so uvicorn fails before binding) and at
+    ``/start`` (defensive — the env could in principle change between import
+    and start).
+    """
+    missing = [v for v in _REQUIRED_ENV_VARS if not os.environ.get(v)]
+    if missing:
+        raise RuntimeError(
+            f"Required environment variable(s) not set: {', '.join(missing)}. "
+            "SERVER_STREAM_SOURCE / PANDA_STREAM_SOURCE point at the Eiger "
+            "detector and PandA box ZMQ endpoints; TILED_BASE_URL is the "
+            "Tiled catalog where results are written. (TILED_API_KEY is "
+            "optional — without it, the cached token from `tiled login` is "
+            "used.)"
+        )
 
 _REQUIRED_CONFIG_FIELDS = (
     "scan_num",
@@ -145,14 +168,7 @@ def start(state: AppState, config: dict | None = None) -> None:
                 f"{_STARTUP_RACE_TIMEOUT:.0f} s. Try again in a moment."
             )
 
-    # Validate required ZMQ env vars before doing anything else.
-    missing = [v for v in _REQUIRED_ENV_VARS if not os.environ.get(v)]
-    if missing:
-        raise RuntimeError(
-            f"Required environment variable(s) not set: {', '.join(missing)}. "
-            "Set SERVER_STREAM_SOURCE and PANDA_STREAM_SOURCE to the ZMQ "
-            "endpoints of the Eiger detector and PandA box respectively."
-        )
+    check_required_env()
 
     # Resolve config: use provided config, fall back to last persisted.
     if config is not None:
