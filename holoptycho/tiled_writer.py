@@ -4,13 +4,10 @@ Writes probe, object, ViT predictions, and associated metadata to a Tiled
 catalog.  Initialized from environment variables:
 
     TILED_BASE_URL   — URL of the Tiled server (required)
-    TILED_API_KEY    — API key for authentication (required)
+    TILED_API_KEY    — API key (optional; falls back to the cached token from
+                       ``tiled login`` for the same server, then anonymous)
     TILED_CATALOG_PATH — path within the catalog to write into
                          (default: hxn/processed/holoptycho)
-
-If either TILED_BASE_URL or TILED_API_KEY is absent, all write methods fall
-back to writing .npy files under /data/users/Holoscan/ (matching the prior
-behaviour) and emit a warning.
 
 A process-wide singleton is maintained so that multiple modules (ptycho_holo,
 vit_inference) share a single Tiled connection.  Use :func:`get_writer` to
@@ -21,8 +18,6 @@ from __future__ import annotations
 
 import logging
 import os
-import warnings
-from typing import Optional
 
 import numpy as np
 
@@ -63,17 +58,20 @@ class TiledWriter:
     base_url:
         Tiled server URL.
     api_key:
-        Tiled API key.
+        Tiled API key.  If ``None`` (no ``TILED_API_KEY`` set),
+        ``tiled.client.from_uri`` falls back to the cached token from
+        ``tiled login`` for the same server, or anonymous access if no token
+        is cached.
     catalog_path:
         Slash-separated path to an **existing** container in the catalog
         (e.g. ``hxn/processed/holoptycho``).  Per-scan sub-containers are
         created beneath it as needed.
     """
 
-    def __init__(self, base_url: str, api_key: str, catalog_path: str):
+    def __init__(self, base_url: str, api_key: str | None, catalog_path: str):
         from tiled.client import from_uri
 
-        client = from_uri(base_url, api_key=api_key)
+        client = from_uri(base_url, api_key=api_key) if api_key else from_uri(base_url)
         # Navigate to the existing root container using plain [] indexing.
         node = client
         for part in catalog_path.strip("/").split("/"):
@@ -218,8 +216,7 @@ class TiledWriter:
         * ``vit/batches/{batch_num:06d}/{pred,indices}`` — append-only per-batch
           history. Required so downstream consumers (synaps-dash, offline
           analysis) can stitch the per-frame ViT predictions across all scan
-          positions, mirroring how ``live_compare_viewer.py`` walks
-          ``vit_batch_NNNNNN_pred.npy`` files in the npy fallback backend.
+          positions.
         """
         if self._run is None:
             logger.warning("write_vit called before start_run; skipping")
@@ -230,7 +227,7 @@ class TiledWriter:
             # Live-polling mirrors (overwritten each batch).
             self._write_or_overwrite_array(vit, "pred_latest", pred, metadata=meta)
             self._write_or_overwrite_array(vit, "indices_latest", indices, metadata=meta)
-            # Per-batch history (append-only, matches npy fallback layout).
+            # Per-batch history (append-only).
             batches = _get_or_create(vit, "batches")
             batch_container = _get_or_create(batches, f"{batch_num:06d}")
             self._write_or_overwrite_array(batch_container, "pred", pred, metadata=meta)
@@ -267,111 +264,17 @@ class TiledWriter:
         except Exception:
             logger.exception("TiledWriter.write_vit_mosaic failed")
 
-class _NpyFallbackWriter:
-    """Writes results to .npy files under /data/users/Holoscan/<run_uid>/ —
-    matches the behaviour before tiled integration was added, but per-run."""
-
-    _BASE = "/data/users/Holoscan"
-
-    def __init__(self):
-        self._run_dir: str | None = None
-
-    def start_run(self, run_uid: str, metadata: dict | None = None) -> None:
-        self._run_dir = f"{self._BASE}/{run_uid}"
-        os.makedirs(self._run_dir, exist_ok=True)
-        if metadata:
-            try:
-                import json
-                with open(f"{self._run_dir}/metadata.json", "w") as f:
-                    json.dump(metadata, f, indent=2, default=str)
-            except Exception:
-                logger.exception("_NpyFallbackWriter: failed to write metadata.json")
-
-    def write_live(self, iteration: int, probe: np.ndarray, obj: np.ndarray) -> None:
-        if self._run_dir is None:
-            logger.warning("write_live called before start_run; skipping")
-            return
-        if not np.isfinite(probe).all() or not np.isfinite(obj).all():
-            logger.warning(
-                "write_live skipped: non-finite values in probe/object at iter=%d "
-                "(keeping last finite snapshot)",
-                iteration,
-            )
-            return
-        try:
-            np.save(f"{self._run_dir}/prb_live.npy", probe)
-            np.save(f"{self._run_dir}/obj_live.npy", obj)
-            with open(f"{self._run_dir}/iteration", "w") as f:
-                f.write("%d\n" % iteration)
-        except Exception:
-            logger.exception("_NpyFallbackWriter.write_live failed")
-
-    def write_final(self, probe, obj, timestamps, num_points) -> None:
-        if self._run_dir is None:
-            logger.warning("write_final called before start_run; skipping")
-            return
-        try:
-            np.save(f"{self._run_dir}/probe.npy", probe)
-            np.save(f"{self._run_dir}/object.npy", obj)
-            np.save(f"{self._run_dir}/timestamp_iter.npy", timestamps)
-            np.save(f"{self._run_dir}/num_points_recv_iter.npy", num_points)
-        except Exception:
-            logger.exception("_NpyFallbackWriter.write_final failed")
-
-    def write_vit(self, batch_num: int, pred: np.ndarray, indices: np.ndarray) -> None:
-        if self._run_dir is None:
-            logger.warning("write_vit called before start_run; skipping")
-            return
-        try:
-            np.save(f"{self._run_dir}/vit_batch_{batch_num:06d}_pred.npy", pred)
-            np.save(f"{self._run_dir}/vit_batch_{batch_num:06d}_indices.npy", indices)
-            tmp = f"{self._run_dir}/_vit_pred_latest.tmp.npy"
-            np.save(tmp, pred)
-            os.replace(tmp, f"{self._run_dir}/vit_pred_latest.npy")
-        except Exception:
-            logger.exception("_NpyFallbackWriter.write_vit failed")
-
-    def write_positions(self, positions_um: np.ndarray) -> None:
-        if self._run_dir is None:
-            logger.warning("write_positions called before start_run; skipping")
-            return
-        try:
-            tmp = f"{self._run_dir}/_positions_um.tmp.npy"
-            np.save(tmp, positions_um)
-            os.replace(tmp, f"{self._run_dir}/positions_um.npy")
-        except Exception:
-            logger.exception("_NpyFallbackWriter.write_positions failed")
-
-    def write_vit_mosaic(
-        self,
-        mosaic: np.ndarray,
-        *,
-        batch_num: int,
-        pixel_size_m: float,
-        canvas_origin_um: tuple[float, float],
-    ) -> None:
-        if self._run_dir is None:
-            logger.warning("write_vit_mosaic called before start_run; skipping")
-            return
-        try:
-            tmp = f"{self._run_dir}/_vit_mosaic.tmp.npy"
-            np.save(tmp, mosaic)
-            os.replace(tmp, f"{self._run_dir}/vit_mosaic.npy")
-        except Exception:
-            logger.exception("_NpyFallbackWriter.write_vit_mosaic failed")
-
-
 # Module-level singleton — shared by all callers within the same process.
-_writer_instance: "TiledWriter | _NpyFallbackWriter | None" = None
+_writer_instance: "TiledWriter | None" = None
 
 
-def get_writer() -> "TiledWriter | _NpyFallbackWriter":
+def get_writer() -> "TiledWriter":
     """Return the process-wide writer singleton.
 
-    Constructed lazily on first call from environment variables:
-
-    * ``TILED_BASE_URL`` and ``TILED_API_KEY`` both set → :class:`TiledWriter`
-    * Otherwise → :class:`_NpyFallbackWriter` (with a warning)
+    Constructed lazily on first call from environment variables.
+    ``TILED_BASE_URL`` is required; raises :class:`RuntimeError` if unset.
+    ``TILED_API_KEY`` is optional — when absent the client falls back to the
+    cached token from ``tiled login`` (or anonymous access).
 
     Subsequent calls return the same instance without re-reading env vars or
     re-connecting to Tiled.
@@ -381,22 +284,11 @@ def get_writer() -> "TiledWriter | _NpyFallbackWriter":
         return _writer_instance
 
     base_url = os.environ.get("TILED_BASE_URL", "").strip()
-    api_key = os.environ.get("TILED_API_KEY", "").strip()
+    api_key = os.environ.get("TILED_API_KEY", "").strip() or None
     catalog_path = os.environ.get("TILED_CATALOG_PATH", _DEFAULT_CATALOG_PATH).strip()
 
-    if not base_url or not api_key:
-        missing = []
-        if not base_url:
-            missing.append("TILED_BASE_URL")
-        if not api_key:
-            missing.append("TILED_API_KEY")
-        warnings.warn(
-            f"Tiled not configured ({', '.join(missing)} not set). "
-            "Falling back to writing .npy files under /data/users/Holoscan/.",
-            stacklevel=2,
-        )
-        _writer_instance = _NpyFallbackWriter()
-    else:
-        _writer_instance = TiledWriter(base_url=base_url, api_key=api_key, catalog_path=catalog_path)
+    if not base_url:
+        raise RuntimeError("Tiled writer requires TILED_BASE_URL to be set.")
 
+    _writer_instance = TiledWriter(base_url=base_url, api_key=api_key, catalog_path=catalog_path)
     return _writer_instance

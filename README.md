@@ -33,9 +33,8 @@ Each pipeline run produces a fresh container under `hxn/processed/holoptycho/{ru
 | `SERVER_STREAM_SOURCE` | ZMQ endpoint of the Eiger detector, e.g. `tcp://<host>:5555` |
 | `PANDA_STREAM_SOURCE` | ZMQ endpoint of the PandA box, e.g. `tcp://<host>:5556` |
 | `TILED_BASE_URL` | URL of the Tiled server |
-| `TILED_API_KEY` | Tiled API key (store in Azure Key Vault — see below) |
 
-The pipeline will refuse to start if `SERVER_STREAM_SOURCE` or `PANDA_STREAM_SOURCE` are not set. If `TILED_BASE_URL` or `TILED_API_KEY` are absent, results fall back to `.npy` files under `/data/users/Holoscan/` with a warning.
+The pipeline will refuse to start if any of `SERVER_STREAM_SOURCE`, `PANDA_STREAM_SOURCE`, or `TILED_BASE_URL` are not set. `TILED_API_KEY` is optional — when unset, the writer uses the cached token from `tiled login` (run once: `tiled profile create <url> --name <name>` then `tiled login --profile <name>`).
 
 ## Optional environment variables
 
@@ -159,7 +158,8 @@ hp logs
 Beamline metadata (energy, scan geometry, pixel size) can be pulled directly from Tiled and piped into `hp start`:
 
 ```bash
-tiled login https://tiled.nsls2.bnl.gov
+tiled profile create https://tiled.nsls2.bnl.gov --name nsls2  # once
+tiled login --profile nsls2
 hp start "$(pixi run -e client config-from-tiled --scan-num 320045)"
 ```
 
@@ -301,7 +301,8 @@ To test holoptycho end-to-end without a live beamline, use `scripts/replay_from_
 
 ```bash
 # 1a. Authenticate with Tiled and install the replay env (once)
-tiled login https://tiled.nsls2.bnl.gov
+tiled profile create https://tiled.nsls2.bnl.gov --name nsls2
+tiled login --profile nsls2
 pixi install -e replay
 
 # 1b. Look up the run UID from a scan id
@@ -491,7 +492,7 @@ export PANDA_STREAM_SOURCE="tcp://localhost:5556"
 export ENGINE_CACHE_DIR="$HOME/.cache/holoptycho/models"
 mkdir -p "$ENGINE_CACHE_DIR"
 
-pixi run start-api   # listens on 127.0.0.1:8000
+pixi run api   # listens on 127.0.0.1:8000
 ```
 
 `SERVER_STREAM_SOURCE` and `PANDA_STREAM_SOURCE` are required — the pipeline refuses to start without them. Use `tcp://localhost:5555` / `tcp://localhost:5556` when pairing with `scripts/replay_from_tiled.py` on the same host.
@@ -502,7 +503,7 @@ pixi run start-api   # listens on 127.0.0.1:8000
 
 ```bash
 nsys profile -t cuda,nvtx,osrt,python-gil -o ptycho_profile.nsys-rep -f true -d 30 \
-    pixi run start-api
+    pixi run api
 ```
 
 Requires `perf_event_paranoid <= 2`:
@@ -516,7 +517,5 @@ sudo sh -c 'echo 2 >/proc/sys/kernel/perf_event_paranoid'
 
 The following are no longer used and remain in the repo for reference only. They will be removed in a future release:
 
-- **`PtychoSimulApp`**, **`InitSimul`**, **`live_simulation.py`** — simulate mode that replayed H5 files directly, bypassing ZMQ. Use `scripts/replay_from_tiled.py` instead.
 - **`InitRecon`**, **`liverecon_utils.py`** — scan header file watcher for detecting new scans from a beamline-written text file. Scan parameters now come from the API config.
 - **`--mode simulate`** CLI option — removed; `hp start` always runs the live ZMQ pipeline.
-- **`eiger_simulation/`** — bespoke Eiger simulator container. Use `scripts/replay_from_tiled.py` with a plain Python environment instead.

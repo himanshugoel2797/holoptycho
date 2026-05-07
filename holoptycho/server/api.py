@@ -100,6 +100,13 @@ def _unexpected_startup_error(exc: Exception) -> HTTPException:
 # ---------------------------------------------------------------------------
 # FastAPI app + startup
 # ---------------------------------------------------------------------------
+
+# Fail fast at import time (i.e. before uvicorn binds to a port) if any of the
+# pipeline's required env vars are missing. The runner repeats this check at
+# /start as a defensive guard, but surfacing it here gives a clean exit
+# instead of a confusing "the API is up but every /start fails" state.
+runner.check_required_env()
+
 app = FastAPI(title="holoptycho API", version="0.1.0", lifespan=lifespan)
 
 
