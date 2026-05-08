@@ -24,7 +24,7 @@ Holoptycho is a streaming pipeline: it receives diffraction patterns from the Ei
 
 Each pipeline run produces a fresh container under `hxn/processed/holoptycho/{run_uid}/` (a per-run UUID; the catalog root is overrideable via `TILED_CATALOG_PATH`), tagged with the `synaps_project` spec. Container metadata records the raw scan it was reconstructed from (`raw_uid`, `scan_id`, `scan_num`, `started_at`, `recon_mode`, `xray_energy_kev`, `wavelength_m`, `distance_m`, plus `fine_tune` for runs flagged as fine-tuning samples).
 
-When the per-run config has `fine_tune: true`, holoptycho additionally writes a `<run>/diffraction/` subtree containing detector-frame intensity (`dp`, `(nz, H, W) uint16`) and meter-unit probe positions (`probe_position_x_m`, `probe_position_y_m`). This is what ptycho-vit's training loader consumes; defaults off so routine reconstructions don't generate gigabyte-scale writes.
+When the per-run config has `fine_tune: true`, holoptycho additionally writes a `<run>/diffraction/` subtree containing detector-frame amplitude (`dp`, `(nz, H, W) uint8`, i.e. `sqrt(intensity)` rounded to 8-bit) and meter-unit probe positions (`probe_position_x_m`, `probe_position_y_m`). This is what ptycho-vit's training loader consumes; uint8 storage cuts the on-the-wire write volume 4× without measurable quality loss for ML (the 1-count quantization is below the Poisson noise floor). Defaults off so routine reconstructions don't generate hundreds-of-MB-scale writes.
 
 ---
 

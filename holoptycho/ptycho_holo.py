@@ -622,10 +622,12 @@ class PtychoApp(Application):
         }
         _writer.start_run(self.run_uid, metadata=run_metadata)
         if enable_fine_tune_writes:
+            # uint8 storage is amplitude (sqrt of detector intensity). See
+            # TiledWriter.start_diffraction_buffer docstring for why.
             _writer.start_diffraction_buffer(
                 nz=int(x_num * y_num),
                 frame_shape=(int(self.param.nx), int(self.param.ny)),
-                dtype=np.uint16,
+                dtype=np.uint8,
             )
 
         # --- PtychoViT inference (parallel to iterative recon) ---

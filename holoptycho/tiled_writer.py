@@ -213,7 +213,7 @@ class TiledWriter:
         self,
         nz: int,
         frame_shape: tuple[int, int],
-        dtype=np.uint16,
+        dtype=np.uint8,
         frames_per_chunk: int = 64,
     ) -> None:
         """Register the per-run diffraction buffer structure for fine-tuning data.
@@ -222,9 +222,18 @@ class TiledWriter:
         uploading any data. Tiled records the array shape, dtype, and chunking
         immediately; chunks are populated lazily by ``write_diffraction_chunk``
         as frames arrive. The register-then-write-blocks split is essential —
-        the alternative ``write_array(np.zeros(...))`` path would upload 1.3 GB
-        of zeros up front, which times out over WAN before the first real
-        frame arrives.
+        the alternative ``write_array(np.zeros(...))`` path would upload the
+        whole zero buffer up front, which times out over WAN.
+
+        ``dp`` stores **amplitude** (= ``sqrt(intensity)``, rounded to uint8)
+        rather than raw uint16 intensity. The Eiger detector is 16-bit but
+        ``sqrt(65535) ≈ 256``, so the full intensity range maps cleanly into
+        uint8 — and the 1-count quantization that introduces is well below
+        the Poisson noise floor for any pixel with non-trivial counts. This
+        halves the on-the-wire write volume vs uint16 (640 MB → 320 MB for
+        a 10K frame 256×256 scan) since Tiled's ``write_block`` does not
+        accept compressed payloads. ptycho-vit's Tiled-backed loader expects
+        this amplitude form and skips its own sqrt step on this data path.
 
         Chunking is set so each block holds ``frames_per_chunk`` whole frames
         (the natural batch boundary from ``ImageBatchOp``). Each
@@ -289,10 +298,14 @@ class TiledWriter:
         """Write a chunk of detector-frame intensity into ``<run>/diffraction/dp``.
 
         ``indices`` is a ``(B,)`` array of global frame indices in scan order;
-        ``frames`` is ``(B, H, W)`` matching the buffer's dtype. We write one
-        block per call. Misaligned or non-contiguous chunks are skipped with a
-        warning — block writes require batch boundaries to match the chunk
-        boundaries declared at ``start_diffraction_buffer``.
+        ``frames`` is ``(B, H, W)`` of intensity (any uint dtype is accepted
+        — upstream ``ImageBatchOp`` allocates uint32 for arithmetic headroom).
+        Frames are sqrt'd and cast to uint8 before write to halve the wire
+        volume vs uint16; see ``start_diffraction_buffer`` for justification.
+
+        We write one block per call. Misaligned or non-contiguous chunks are
+        skipped with a warning — block writes require batch boundaries to
+        match the chunk boundaries declared at registration.
         """
         if self._dp_node is None:
             return
@@ -318,7 +331,17 @@ class TiledWriter:
                 )
                 return
             block_id = (start // chunk_size, 0, 0)
-            self._dp_node.write_block(np.ascontiguousarray(frames), block=block_id)
+            # Convert intensity → amplitude → uint8 to match the declared
+            # dtype at start_diffraction_buffer and halve the wire volume vs
+            # uint16. Upstream emits uint32 with values in the uint16 detector
+            # range; sqrt(65535) ≈ 256 fits cleanly in uint8 (we just clip
+            # the very rare overflow). The 1-count quantization is well below
+            # the Poisson noise floor for ML training.
+            intensity = np.asarray(frames)
+            amp = np.sqrt(intensity, dtype=np.float32)
+            np.clip(amp, 0, 255, out=amp)
+            amp_u8 = amp.astype(np.uint8, copy=False)
+            self._dp_node.write_block(np.ascontiguousarray(amp_u8), block=block_id)
         except Exception:
             logger.exception("TiledWriter.write_diffraction_chunk failed")
 

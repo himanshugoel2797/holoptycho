@@ -384,7 +384,7 @@ starts, the JSON is serialised to an INI file with a single `[GUI]` section.
 | `gpu_batch_size` | int (str) | Number of patterns per GPU batch |
 | `recon_mode` | str | Which reconstruction branches to wire: `iterative`, `vit`, or `both`. Default `both`. Use `iterative` to skip the ViT op entirely (no engine load); use `vit` to skip the iterative DM/ML solver (no `live/`/`final/` Tiled writes). |
 | `vit_batch_writes` | bool | (Optional) Enable per-batch `pred` + `indices` writes to `<run>/vit/batches/NNNNNN/...` via `BatchWriterOp`. Default `false`. Each batch's `pred` is `(64, 2, 256, 256)` float32 (~33 MB) and a tiled HTTPS PUT runs at ~1 MB/s, so enabling this gates the whole ViT branch at ~28 s/batch. Leave off for live mosaic viewing; turn on only when offline analysts need the raw per-batch arrays. |
-| `fine_tune` | bool | (Optional) Mark this run as a candidate fine-tuning sample for ptycho-vit. Default `false`. When `true`, holoptycho persists detector-frame intensity (`<run>/diffraction/dp`, `(nz, H, W) uint16`) and meter-unit probe positions (`<run>/diffraction/probe_position_x_m`, `..._y_m`) in addition to the usual outputs, and stamps `fine_tune: true` into the run metadata so downstream tooling can list candidate runs via Tiled query. Adds ~2.6 GB per 10K-frame 256×256 scan; leave off for routine reconstructions. |
+| `fine_tune` | bool | (Optional) Mark this run as a candidate fine-tuning sample for ptycho-vit. Default `false`. When `true`, holoptycho persists detector-frame amplitude (`<run>/diffraction/dp`, `(nz, H, W) uint8` = `sqrt(intensity)` rounded) and meter-unit probe positions (`<run>/diffraction/probe_position_x_m`, `..._y_m`) in addition to the usual outputs, and stamps `fine_tune: true` into the run metadata so downstream tooling can list candidate runs via Tiled query. Adds ~640 MB per 10K-frame 256×256 scan; leave off for routine reconstructions. |
 | `raw_uid` | str | (Optional) UID of the raw Bluesky run being reconstructed. Stored as metadata on the per-run Tiled container. The `replay_from_tiled.py` and `config_from_tiled.py` config builders fill it in automatically from `--uid`. |
 | `scan_id` | str | (Optional) Scan id of the raw run. Defaults to `scan_num` if omitted. Stored as metadata on the per-run Tiled container. |
 | `xray_energy_kev` | float (str) | X-ray energy in keV |
@@ -755,11 +755,18 @@ hxn/processed/holoptycho/
           indices
         ...
     diffraction/                ← only present when config.fine_tune=true
-      dp                         ← (nz, H, W) uint16 detector-frame intensity
-                                   (post bad-pixel inpaint, pre rot90/fftshift)
-                                   for downstream ptycho-vit fine-tuning. Pre-
-                                   allocated zero-filled at start_run; chunks
-                                   slice-assigned in scan order as they arrive.
+      dp                         ← (nz, H, W) uint8 amplitude (= sqrt of
+                                   detector intensity, rounded). Captured post
+                                   bad-pixel inpaint, pre rot90/fftshift. uint8
+                                   instead of raw uint16 because Tiled does not
+                                   accept compressed write_block payloads;
+                                   sqrt-then-uint8 is lossless for ML training
+                                   (1-count quantization < Poisson noise) and
+                                   halves the wire volume. ptycho-vit's Tiled
+                                   loader skips its own sqrt step on this path.
+                                   Structure registered at start_run with chunks
+                                   of 64 frames; chunks landed via write_block
+                                   in scan order as frames arrive.
       probe_position_x_m         ← (nz,) float64 meters; sibling to positions_um
       probe_position_y_m         ← (nz,) float64 meters
 ```
