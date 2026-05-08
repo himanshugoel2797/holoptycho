@@ -81,6 +81,10 @@ class TiledWriter:
         # Per-run container created lazily by start_run().
         self._run = None
         self._run_uid: str | None = None
+        # Diffraction buffer node, set by start_diffraction_buffer when
+        # fine_tune writes are enabled.
+        self._dp_node = None
+        self._dp_chunk_size = 0
         logger.info("TiledWriter connected: %s / %s", base_url, catalog_path)
 
     # ------------------------------------------------------------------
@@ -200,6 +204,186 @@ class TiledWriter:
             self._write_or_overwrite_array(self._run, "positions_um", positions_um)
         except Exception:
             logger.exception("TiledWriter.write_positions failed")
+
+    # ------------------------------------------------------------------
+    # Fine-tuning writes — only used when config.fine_tune=True
+    # ------------------------------------------------------------------
+
+    def start_diffraction_buffer(
+        self,
+        nz: int,
+        frame_shape: tuple[int, int],
+        dtype=np.uint8,
+        frames_per_chunk: int = 64,
+    ) -> None:
+        """Register the per-run diffraction buffer structure for fine-tuning data.
+
+        Registers a ``(nz, H, W)`` array under ``<run>/diffraction/dp`` *without*
+        uploading any data. Tiled records the array shape, dtype, and chunking
+        immediately; chunks are populated lazily by ``write_diffraction_chunk``
+        as frames arrive. The register-then-write-blocks split is essential —
+        the alternative ``write_array(np.zeros(...))`` path would upload the
+        whole zero buffer up front, which times out over WAN.
+
+        ``dp`` stores **amplitude** (= ``sqrt(intensity)``, rounded to uint8)
+        rather than raw uint16 intensity. The Eiger detector is 16-bit but
+        ``sqrt(65535) ≈ 256``, so the full intensity range maps cleanly into
+        uint8 — and the 1-count quantization that introduces is well below
+        the Poisson noise floor for any pixel with non-trivial counts. This
+        halves the on-the-wire write volume vs uint16 (640 MB → 320 MB for
+        a 10K frame 256×256 scan) since Tiled's ``write_block`` does not
+        accept compressed payloads. ptycho-vit's Tiled-backed loader expects
+        this amplitude form and skips its own sqrt step on this data path.
+
+        Chunking is set so each block holds ``frames_per_chunk`` whole frames
+        (the natural batch boundary from ``ImageBatchOp``). Each
+        ``write_diffraction_chunk`` call writes exactly one block.
+        """
+        if self._run is None:
+            logger.warning("start_diffraction_buffer before start_run; skipping")
+            return
+        try:
+            from tiled.structures.array import ArrayStructure, BuiltinDtype
+            from tiled.structures.core import StructureFamily
+            from tiled.structures.data_source import DataSource
+
+            diffraction = _get_or_create(self._run, "diffraction")
+            h, w = int(frame_shape[0]), int(frame_shape[1])
+            dtype_np = np.dtype(dtype)
+
+            # Frame chunking matches ImageBatchOp's batch size so each
+            # FrameWriterOp invocation maps to exactly one block_id.
+            n_full = nz // frames_per_chunk
+            rem = nz - n_full * frames_per_chunk
+            chunk_dim0 = (frames_per_chunk,) * n_full
+            if rem:
+                chunk_dim0 = chunk_dim0 + (rem,)
+            structure = ArrayStructure(
+                shape=(int(nz), h, w),
+                chunks=(chunk_dim0, (h,), (w,)),
+                data_type=BuiltinDtype.from_numpy_dtype(dtype_np),
+            )
+            data_source = DataSource(
+                structure=structure,
+                structure_family=StructureFamily.array,
+            )
+            # Replace any prior dp node so re-runs of the same run_uid
+            # (shouldn't happen — fresh uuid each compose — but defensive)
+            # don't fight an existing array.
+            if "dp" in diffraction:
+                del diffraction["dp"]
+            self._dp_node = diffraction.new(
+                StructureFamily.array,
+                [data_source],
+                key="dp",
+                specs=_SPECS,
+                access_tags=_ACCESS_TAGS,
+            )
+            self._dp_chunk_size = int(frames_per_chunk)
+            logger.info(
+                "TiledWriter.start_diffraction_buffer run=%s shape=(%d,%d,%d) "
+                "dtype=%s chunks=%d frames",
+                self._run_uid, nz, h, w, dtype_np, frames_per_chunk,
+            )
+        except Exception:
+            logger.exception("TiledWriter.start_diffraction_buffer failed")
+            self._dp_node = None
+            self._dp_chunk_size = 0
+
+    def write_diffraction_chunk(
+        self,
+        indices: np.ndarray,
+        frames: np.ndarray,
+    ) -> None:
+        """Write a chunk of detector-frame intensity into ``<run>/diffraction/dp``.
+
+        ``indices`` is a ``(B,)`` array of global frame indices in scan order;
+        ``frames`` is ``(B, H, W)`` of intensity (any uint dtype is accepted
+        — upstream ``ImageBatchOp`` allocates uint32 for arithmetic headroom).
+        Frames are sqrt'd and cast to uint8 before write to halve the wire
+        volume vs uint16; see ``start_diffraction_buffer`` for justification.
+
+        We write one block per call. Misaligned or non-contiguous chunks are
+        skipped with a warning — block writes require batch boundaries to
+        match the chunk boundaries declared at registration.
+        """
+        if self._dp_node is None:
+            return
+        try:
+            indices = np.asarray(indices)
+            if len(indices) == 0:
+                return
+            start = int(indices[0])
+            n = len(indices)
+            chunk_size = getattr(self, "_dp_chunk_size", 0) or n
+            if start % chunk_size != 0:
+                logger.warning(
+                    "write_diffraction_chunk: misaligned start=%d "
+                    "(chunk_size=%d); skipping",
+                    start, chunk_size,
+                )
+                return
+            if not np.all(np.diff(indices) == 1):
+                logger.warning(
+                    "write_diffraction_chunk: non-contiguous indices "
+                    "[%d..%d]; skipping",
+                    start, int(indices[-1]),
+                )
+                return
+            block_id = (start // chunk_size, 0, 0)
+            # Convert intensity → amplitude → uint8 to match the declared
+            # dtype at start_diffraction_buffer and halve the wire volume vs
+            # uint16. Upstream emits uint32 with values in the uint16 detector
+            # range; sqrt(65535) ≈ 256 fits cleanly in uint8 (we just clip
+            # the very rare overflow). The 1-count quantization is well below
+            # the Poisson noise floor for ML training.
+            intensity = np.asarray(frames)
+            amp = np.sqrt(intensity, dtype=np.float32)
+            np.clip(amp, 0, 255, out=amp)
+            amp_u8 = amp.astype(np.uint8, copy=False)
+            self._dp_node.write_block(np.ascontiguousarray(amp_u8), block=block_id)
+        except Exception:
+            logger.exception("TiledWriter.write_diffraction_chunk failed")
+
+    def write_probe_positions_m(
+        self,
+        x_m: np.ndarray,
+        y_m: np.ndarray,
+    ) -> None:
+        """Overwrite the per-frame probe positions in meters.
+
+        Sibling to ``write_positions`` (which writes microns under the run
+        root); this writes the SI-unit form ptycho-vit's loader expects, under
+        ``<run>/diffraction/probe_position_x_m`` and ``..._y_m``. Only called
+        when fine-tuning writes are enabled.
+        """
+        if self._run is None:
+            logger.warning("write_probe_positions_m before start_run; skipping")
+            return
+        try:
+            diffraction = _get_or_create(self._run, "diffraction")
+            self._write_or_overwrite_array(diffraction, "probe_position_x_m", x_m)
+            self._write_or_overwrite_array(diffraction, "probe_position_y_m", y_m)
+        except Exception:
+            logger.exception("TiledWriter.write_probe_positions_m failed")
+
+    def mark_run_complete(self) -> None:
+        """Stamp ``complete: true`` into the per-run container metadata.
+
+        Called when the holoscan pipeline naturally finishes processing the
+        scan — either at iterative end-of-run (``SaveResult``) for
+        iterative/both modes, or at clean subprocess exit for any mode.
+        Lets downstream consumers query for finalised runs without having
+        to inspect subcontainers.
+        """
+        if self._run is None:
+            logger.warning("mark_run_complete before start_run; skipping")
+            return
+        try:
+            self._run.update_metadata(metadata={"complete": True})
+            logger.info("TiledWriter.mark_run_complete run=%s", self._run_uid)
+        except Exception:
+            logger.exception("TiledWriter.mark_run_complete failed")
 
     def write_vit(
         self,

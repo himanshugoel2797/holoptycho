@@ -22,7 +22,9 @@ Holoptycho is a streaming pipeline: it receives diffraction patterns from the Ei
 - **`PtychoRecon`** — iterative DM/ML reconstruction on GPU 0
 - **`PtychoViTInferenceOp`** — parallel neural network inference on GPU 1
 
-Each pipeline run produces a fresh container under `hxn/processed/holoptycho/{run_uid}/` (a per-run UUID; the catalog root is overrideable via `TILED_CATALOG_PATH`), tagged with the `synaps_project` spec. Container metadata records the raw scan it was reconstructed from (`raw_uid`, `scan_id`, `scan_num`, `started_at`, `recon_mode`).
+Each pipeline run produces a fresh container under `hxn/processed/holoptycho/{run_uid}/` (a per-run UUID; the catalog root is overrideable via `TILED_CATALOG_PATH`), tagged with the `synaps_project` spec. Container metadata records the raw scan it was reconstructed from (`raw_uid`, `scan_id`, `scan_num`, `started_at`, `recon_mode`, `xray_energy_kev`, `wavelength_m`, `distance_m`, plus a boolean `fine_tunable` flag that's true iff `recon_mode` is `iterative` or `both`).
+
+Every run also writes a `<run>/diffraction/` subtree containing detector-frame amplitude (`dp`, `(nz, H, W) uint8`, i.e. `sqrt(intensity)` rounded to 8-bit) and meter-unit probe positions (`probe_position_x_m`, `probe_position_y_m`). uint8 storage cuts the on-the-wire write volume in half versus uint16 without measurable quality loss for ML (the 1-count quantization is below the Poisson noise floor). A run is usable as a ptycho-vit fine-tuning sample iff its metadata has `fine_tunable: true` — the iterative branch then also writes `final/probe` and `final/object` as supervised targets.
 
 ---
 

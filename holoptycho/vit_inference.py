@@ -694,6 +694,14 @@ class PositionsWriterOp(Operator):
         try:
             t0 = time.perf_counter()
             _writer.write_positions(positions)
+            # Always emit meter-unit x/y alongside the existing micron-unit
+            # array under <run>/diffraction/. Tiny extra payload (~160 KB)
+            # and gives ptycho-vit's loader the SI form it expects without
+            # a unit conversion or a per-run feature flag.
+            _writer.write_probe_positions_m(
+                x_m=positions[:, 0] * 1e-6,
+                y_m=positions[:, 1] * 1e-6,
+            )
             self._logger.info(
                 "PositionsWriterOp: wrote in %.0f ms",
                 (time.perf_counter() - t0) * 1000,

@@ -753,7 +753,36 @@ hxn/processed/holoptycho/
           pred
           indices
         ...
+    diffraction/                ← always written (every run)
+      dp                         ← (nz, H, W) uint8 amplitude (= sqrt of
+                                   detector intensity, rounded). Captured post
+                                   bad-pixel inpaint, pre rot90/fftshift. uint8
+                                   instead of raw uint16 because Tiled does not
+                                   accept compressed write_block payloads;
+                                   sqrt-then-uint8 is lossless for ML training
+                                   (1-count quantization < Poisson noise) and
+                                   halves the wire volume. ptycho-vit's Tiled
+                                   loader skips its own sqrt step on this path.
+                                   Structure registered at start_run with chunks
+                                   of 64 frames; chunks landed via write_block
+                                   in scan order as frames arrive.
+      probe_position_x_m         ← (nz,) float64 meters; sibling to positions_um
+      probe_position_y_m         ← (nz,) float64 meters
 ```
+
+Run metadata also includes `xray_energy_kev`, `wavelength_m`, `distance_m`,
+`fine_tunable: bool`, and `complete: bool`.
+
+- `xray_energy_kev`, `wavelength_m`, `distance_m` — needed by physics-aware
+  loaders.
+- `fine_tunable` — `True` iff `recon_mode` is `iterative` or `both` (i.e.
+  the iterative branch will populate `final/probe` and `final/object`,
+  which ptycho-vit's training loader requires). Filter for fine-tuning
+  candidates via `Eq("fine_tunable", True)`.
+- `complete` — starts `False`; flipped to `True` when the holoscan pipeline
+  finishes processing this scan (at iterative end-of-run for `iterative` /
+  `both` modes, or at clean subprocess exit for `vit`-only). Filter for
+  finalised runs via `Eq("complete", True)`.
 
 `run_uid` is generated in `PtychoApp.compose()` and surfaced via
 `TiledWriter.start_run(run_uid, metadata)`. `raw_uid` and `raw_scan_id` come
