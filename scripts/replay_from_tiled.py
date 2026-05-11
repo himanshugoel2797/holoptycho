@@ -533,7 +533,12 @@ def iter_frame_chunks(
             yield chunk
 
 
-def _json_request(url: str, method: str = "GET", payload: dict | None = None) -> dict:
+def _json_request(
+    url: str,
+    method: str = "GET",
+    payload: dict | None = None,
+    timeout: float = 90,
+) -> dict:
     data = None if payload is None else json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -542,7 +547,11 @@ def _json_request(url: str, method: str = "GET", payload: dict | None = None) ->
         headers={"Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        # 90s default — generous enough for /run, which now blocks on the
+        # subprocess composing its operator graph (ZMQ SUB binds, TiledWriter
+        # init, etc — typically ~6s but can be longer on cold model loads).
+        # Server-side budget is 60s.
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8")) if resp.readable() else {}
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
@@ -579,9 +588,15 @@ def start_holoptycho_pipeline(args) -> None:
                 time.sleep(2.0)
                 continue
             raise
-    print(f"[holoptycho] {result.get('detail', 'pipeline request submitted')}", flush=True)
-    if args.hp_startup_wait > 0:
-        time.sleep(args.hp_startup_wait)
+    # /run and /restart now block server-side until the pipeline reports
+    # ready (operators composed, ZMQ SUBs bound). On 200 the response is a
+    # status snapshot rather than {"detail": ...}, so look for both shapes.
+    label = result.get("detail") or (
+        f"pipeline ready (status={result.get('status')!r})"
+        if "status" in result
+        else "pipeline request submitted"
+    )
+    print(f"[holoptycho] {label}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -624,12 +639,6 @@ def parse_args():
         "--hp-config-tiled-url",
         default=os.environ.get("HP_CONFIG_TILED_URL", os.environ.get("TILED_CONFIG_BASE_URL", "")),
         help="Tiled URL used to build the hp config for --hp-start; defaults to --tiled-url",
-    )
-    parser.add_argument(
-        "--hp-startup-wait",
-        type=float,
-        default=2.0,
-        help="Seconds to wait after --hp-start before publishing ZMQ (default: 2.0)",
     )
     add_reconstruction_arguments(parser)
     parser.add_argument(

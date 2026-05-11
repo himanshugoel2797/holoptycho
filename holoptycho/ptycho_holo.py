@@ -21,6 +21,15 @@ _finish_event = threading.Event()
 # Holoscan teardown crash into rc=0.
 _work_complete = threading.Event()
 
+# Set at the very end of PtychoApp.compose() — after every operator has been
+# instantiated, every flow added, and config_ops() called (which is what
+# initialises ImageBatchOp.roi etc). The subprocess sentinel watcher reads
+# this to flip state.pipeline_ready=True in the parent API process, so
+# external publishers can block until the pipeline can actually consume
+# frames. Without this, ZMQ PUB silently drops frames sent before the SUB is
+# bound (~6 s after /run on a cold start).
+_pipeline_ready = threading.Event()
+
 import numpy as np
 import cupy as cp
 from numba import cuda
@@ -410,6 +419,7 @@ class FrameWriterOp(Operator):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._first_batch = True
 
     def setup(self, spec: OperatorSpec):
         spec.input("intensity").connector(IOSpec.ConnectorType.DOUBLE_BUFFER, capacity=32)
@@ -418,7 +428,28 @@ class FrameWriterOp(Operator):
     def compute(self, op_input, op_output, context):
         frames = op_input.receive("intensity")
         indices = op_input.receive("image_indices")
-        _writer.write_diffraction_chunk(np.asarray(indices), np.asarray(frames))
+        idx_arr = np.asarray(indices)
+        if self._first_batch:
+            # Fail fast if the first batch isn't aligned to scan-frame zero —
+            # that means upstream dropped frames (e.g. ZMQ PUB slow-joiner
+            # race), and silently continuing would leave dp[0..N-1] filled
+            # with the zero initial state. A model trained on those slots
+            # would learn that "black detector" maps to whatever object/probe
+            # was at those positions — real harm. Better to abort the run so
+            # the operator can fix the publisher and retry.
+            first = int(idx_arr[0])
+            if first != 0:
+                raise RuntimeError(
+                    f"FrameWriterOp: first batch starts at scan frame {first}, "
+                    "expected 0. Frames were dropped before the pipeline could "
+                    "receive them. Likely cause: publisher started pushing "
+                    "before holoptycho's ZMQ SUB was live (ZMQ PUB silently "
+                    "drops to a not-yet-subscribed peer). Restart the "
+                    "publisher after /run returns 200 — the API now blocks "
+                    "until the pipeline is ready."
+                )
+            self._first_batch = False
+        _writer.write_diffraction_chunk(idx_arr, np.asarray(frames))
 
 
 class PtychoApp(Application):
@@ -708,6 +739,15 @@ class PtychoApp(Application):
                 # Per-batch pred + indices via a bounded FIFO (no drop,
                 # every batch is unique data). Gated by config.
                 self.add_flow(self.vit_save, self.batch_writer, {("vit_batch", "batch")})
+
+        # Graph is built and every op's __init__ has run — for EigerZmqRxOp
+        # that means socket.connect() has fired, so the SUB is bound to the
+        # publisher endpoint. Setting this flag triggers the subprocess
+        # sentinel watcher, which lets the parent API release a /run caller
+        # that's been blocking on readiness. Frames sent now will land in the
+        # SUB's HWM buffer until the scheduler starts pulling them in
+        # app.run() (the very next call).
+        _pipeline_ready.set()
 
 
 def main():

@@ -107,17 +107,19 @@ def test_run_no_config_no_last_config_returns_400(client):
 
 
 def test_run_with_config_starts_app(client):
-    with patch("holoptycho.server.runner.start") as mock_start:
+    with patch("holoptycho.server.runner.start") as mock_start, \
+         patch("holoptycho.server.runner.wait_for_ready", return_value=True):
         resp = client.post("/run", json={"config": _VALID_CONFIG})
-    assert resp.status_code == 202
+    assert resp.status_code == 200
     mock_start.assert_called_once_with(state=state_module.state, config=_VALID_CONFIG)
 
 
 def test_run_no_config_uses_last_config(client):
     state_module.state.update(last_config=_VALID_CONFIG)
-    with patch("holoptycho.server.runner.start") as mock_start:
+    with patch("holoptycho.server.runner.start") as mock_start, \
+         patch("holoptycho.server.runner.wait_for_ready", return_value=True):
         resp = client.post("/run")
-    assert resp.status_code == 202
+    assert resp.status_code == 200
     mock_start.assert_called_once_with(state=state_module.state, config=None)
 
 
@@ -147,9 +149,30 @@ def test_run_blocked_while_pipeline_active(client):
 
 def test_run_no_body_uses_last_config(client):
     state_module.state.update(last_config=_VALID_CONFIG)
-    with patch("holoptycho.server.runner.start") as mock_start:
+    with patch("holoptycho.server.runner.start"), \
+         patch("holoptycho.server.runner.wait_for_ready", return_value=True):
         resp = client.post("/run")
-    assert resp.status_code == 202
+    assert resp.status_code == 200
+
+
+def test_run_504_if_pipeline_never_signals_ready(client):
+    """If the subprocess never reaches the ready sentinel, /run should 504."""
+    state_module.state.update(status="running", pipeline_ready=False)
+    with patch("holoptycho.server.runner.start"), \
+         patch("holoptycho.server.runner.wait_for_ready", return_value=False):
+        resp = client.post("/run", json={"config": _VALID_CONFIG})
+    assert resp.status_code == 504
+    assert "ready" in resp.json()["detail"].lower()
+
+
+def test_run_500_if_subprocess_exits_before_ready(client):
+    """If the subprocess crashes during composition, /run should 500."""
+    state_module.state.update(status="error", error="subprocess died", pipeline_ready=False)
+    with patch("holoptycho.server.runner.start"), \
+         patch("holoptycho.server.runner.wait_for_ready", return_value=False):
+        resp = client.post("/run", json={"config": _VALID_CONFIG})
+    assert resp.status_code == 500
+    assert "subprocess" in resp.json()["detail"].lower() or "exit" in resp.json()["detail"].lower()
 
 
 # ---------------------------------------------------------------------------
@@ -177,9 +200,10 @@ def test_stop_when_not_running(client):
 def test_restart_running_app(client):
     state_module.state.update(status="running", last_config=_VALID_CONFIG)
     with patch("holoptycho.server.runner.stop"), \
-         patch("holoptycho.server.runner.start") as mock_start:
+         patch("holoptycho.server.runner.start") as mock_start, \
+         patch("holoptycho.server.runner.wait_for_ready", return_value=True):
         resp = client.post("/restart")
-    assert resp.status_code == 202
+    assert resp.status_code == 200
     mock_start.assert_called_once_with(state=state_module.state, config=None)
 
 
@@ -187,9 +211,10 @@ def test_restart_with_new_config(client):
     state_module.state.update(status="running", last_config=_VALID_CONFIG)
     new_config = {**_VALID_CONFIG, "scan_num": "320046"}
     with patch("holoptycho.server.runner.stop"), \
-         patch("holoptycho.server.runner.start") as mock_start:
+         patch("holoptycho.server.runner.start") as mock_start, \
+         patch("holoptycho.server.runner.wait_for_ready", return_value=True):
         resp = client.post("/restart", json={"config": new_config})
-    assert resp.status_code == 202
+    assert resp.status_code == 200
     mock_start.assert_called_once_with(state=state_module.state, config=new_config)
 
 

@@ -142,16 +142,52 @@ def get_config():
     return cfg
 
 
-@app.post("/run", status_code=202)
+def _wait_for_pipeline_ready() -> dict:
+    """Block until the spawned subprocess signals readiness.
+
+    Translates the wait outcome into HTTP-shaped responses so /run and
+    /restart can share the logic. Raises HTTPException on failure; returns
+    the state snapshot on success.
+    """
+    if runner.wait_for_ready():
+        return state.snapshot()
+    snap = state.snapshot()
+    if snap["status"] in ("error", "stopped", "finished"):
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Pipeline subprocess exited before reporting ready "
+                f"(status={snap['status']!r}, error={snap.get('error')!r}). "
+                "Check the holoptycho log for the underlying failure."
+            ),
+        )
+    raise HTTPException(
+        status_code=504,
+        detail=(
+            "Pipeline did not report ready within the startup budget. "
+            "The subprocess is still running — call /stop to abort or "
+            "/status to inspect."
+        ),
+    )
+
+
+@app.post("/run")
 def post_run(req: RunRequest = RunRequest()):
-    """Start the Holoscan pipeline, optionally with a new config."""
+    """Start the Holoscan pipeline and block until it is ready to consume frames.
+
+    Returns 200 + a status snapshot once the pipeline has finished composing
+    and ZMQ SUBs are bound. Returns 504 if startup exceeds the budget, or
+    500 if the subprocess exits before signaling ready. Callers can treat a
+    successful return as "safe to start publishing frames now" — no client-
+    side polling required.
+    """
     try:
         runner.start(state=state, config=req.config)
     except (RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         raise _unexpected_startup_error(exc)
-    return {"detail": "Starting pipeline"}
+    return _wait_for_pipeline_ready()
 
 
 @app.post("/stop", status_code=202)
@@ -163,9 +199,9 @@ def post_stop():
     return {"detail": "Stop requested"}
 
 
-@app.post("/restart", status_code=202)
+@app.post("/restart")
 def post_restart(req: RunRequest = RunRequest()):
-    """Stop the running app and restart it, optionally with a new config.
+    """Stop the running app and restart it, blocking until ready (see /run).
 
     runner.stop() blocks until the pipeline has fully exited (soft+hard stop
     sequence handles all cases internally), so /restart is just stop+start
@@ -193,7 +229,7 @@ def post_restart(req: RunRequest = RunRequest()):
     except Exception as exc:
         raise _unexpected_startup_error(exc)
 
-    return {"detail": "Restarting pipeline"}
+    return _wait_for_pipeline_ready()
 
 
 # ---------------------------------------------------------------------------

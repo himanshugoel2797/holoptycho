@@ -17,6 +17,12 @@ class AppState:
     status: str = "stopped"  # stopped | starting | running | finished | error
     start_time: Optional[float] = None
     error: Optional[str] = None
+    # True once the Holoscan pipeline has finished composing and is actually
+    # consuming frames. Distinct from ``status=running`` (subprocess alive but
+    # may still be wiring operators / binding ZMQ SUB sockets). External
+    # publishers (replay, real Eiger driver) should block on this flag before
+    # pushing — ZMQ PUB silently drops to a not-yet-subscribed peer.
+    pipeline_ready: bool = False
 
     # Last config used (persisted in DB across restarts)
     last_config: Optional[dict] = None
@@ -51,6 +57,7 @@ class AppState:
                 "status": self.status,
                 "uptime_seconds": uptime,
                 "error": self.error,
+                "pipeline_ready": self.pipeline_ready,
                 "last_config": self.last_config,
                 "model_status": self.model_status,
                 "model_error": self.model_error,

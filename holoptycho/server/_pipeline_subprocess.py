@@ -98,6 +98,38 @@ def _install_finish_handler() -> None:
     signal.signal(signal.SIGUSR1, _handler)
 
 
+def _write_ready_sentinel() -> None:
+    """Drop a sentinel file when the Holoscan graph is composed and the
+    pipeline is ready to consume frames.
+
+    Mirrors ``_write_work_complete_sentinel`` but for the start-of-run signal.
+    The parent API's runner watches for this file and flips
+    ``state.pipeline_ready = True``, which is what lets ``/run`` return to
+    callers (the handler blocks on a threading.Event the runner sets).
+
+    Without this signal, external publishers had no reliable way to know when
+    holoptycho's ZMQ SUB was live — the fixed ``hp_startup_wait`` sleep in
+    the replay script was empirically too short on cold start, and ZMQ PUB
+    silently dropped the first ~50 frames.
+    """
+    sentinel = os.environ.get("HOLOPTYCHO_READY_SENTINEL")
+    if not sentinel:
+        return
+
+    def _watcher():
+        from holoptycho import ptycho_holo
+        ptycho_holo._pipeline_ready.wait()
+        try:
+            Path(sentinel).touch()
+            logger.info("Wrote pipeline-ready sentinel: %s", sentinel)
+        except OSError:
+            logger.exception("Failed to write pipeline-ready sentinel")
+
+    import threading
+    t = threading.Thread(target=_watcher, daemon=True, name="pipeline-ready-watcher")
+    t.start()
+
+
 def _write_work_complete_sentinel() -> None:
     """Drop a sentinel file when the natural-termination path completes.
 
@@ -135,6 +167,7 @@ def main() -> int:
     _bump_stack_size()
     _configure_logging()
     _install_finish_handler()
+    _write_ready_sentinel()
     _write_work_complete_sentinel()
 
     raw = sys.stdin.read()

@@ -51,6 +51,20 @@ _state_lock = threading.Lock()
 # even after the work fully completed.
 _WORK_COMPLETE_SENTINEL = Path("/tmp/holoptycho_work_complete")
 
+# Sentinel file the subprocess touches once PtychoApp.compose() finishes —
+# every operator is constructed, EigerZmqRxOp's SUB is connected, and the
+# scheduler is about to start. The /run handler blocks on _ready_event,
+# which a watcher thread sets when this sentinel appears, so callers can
+# treat /run as synchronous wrt pipeline readiness.
+_READY_SENTINEL = Path("/tmp/holoptycho_pipeline_ready")
+_ready_event = threading.Event()
+
+# Cold-start budget for the pipeline. Composition takes ~6 s in practice
+# (TiledWriter init + operator graph wiring + ZMQ SUB connect); 60 s is
+# generous enough for slow model loads or cold TRT engine caches without
+# letting a stuck pipeline hold a /run request forever.
+_PIPELINE_READY_TIMEOUT = 60.0
+
 # Soft stop window. Long enough for PtychoRecon to trip the iteration-cap
 # branch and for SaveResult to write_final to Tiled.
 _SOFT_STOP_TIMEOUT = 10.0
@@ -200,17 +214,20 @@ def start(state: AppState, config: dict | None = None) -> None:
     child_env["HOLOPTYCHO_LOG_FILE"] = state.log_file
     child_env["HOLOPTYCHO_CONFIG_PATH"] = str(config_path)
     child_env["HOLOPTYCHO_COMPLETE_SENTINEL"] = str(_WORK_COMPLETE_SENTINEL)
+    child_env["HOLOPTYCHO_READY_SENTINEL"] = str(_READY_SENTINEL)
     if state.current_engine_path:
         child_env["HOLOPTYCHO_ENGINE_PATH"] = state.current_engine_path
 
-    # Clear stale sentinel from any prior run.
+    # Clear stale sentinels from any prior run.
     _WORK_COMPLETE_SENTINEL.unlink(missing_ok=True)
+    _READY_SENTINEL.unlink(missing_ok=True)
+    _ready_event.clear()
 
     # Reset stop bookkeeping before spawning.
     with _state_lock:
         _stop_requested = False
 
-    state.update(start_time=time.time(), error=None)
+    state.update(start_time=time.time(), error=None, pipeline_ready=False)
 
     try:
         proc = subprocess.Popen(
@@ -250,6 +267,47 @@ def start(state: AppState, config: dict | None = None) -> None:
         name="holoscan-monitor",
     )
     monitor.start()
+
+    ready_watcher = threading.Thread(
+        target=_watch_ready,
+        args=(state, proc),
+        daemon=True,
+        name="pipeline-ready-watcher",
+    )
+    ready_watcher.start()
+
+
+def _watch_ready(state: AppState, proc: subprocess.Popen) -> None:
+    """Poll the ready sentinel and flip ``state.pipeline_ready`` when it lands.
+
+    Exits early if the subprocess dies first (so a /run caller blocked on
+    ``_ready_event`` gets unstuck — the event stays unset, ``wait_for_ready``
+    detects the dead subprocess and returns False).
+    """
+    while True:
+        if _READY_SENTINEL.exists():
+            state.update(pipeline_ready=True)
+            _ready_event.set()
+            logger.info("Pipeline reported ready (pid=%d)", proc.pid)
+            return
+        if proc.poll() is not None:
+            # Subprocess exited before signaling ready. _monitor will set
+            # state.status; we just have to make sure no one waits forever.
+            _ready_event.set()
+            return
+        time.sleep(0.05)
+
+
+def wait_for_ready(timeout: float = _PIPELINE_READY_TIMEOUT) -> bool:
+    """Block until the pipeline subprocess signals readiness.
+
+    Returns True if ``_pipeline_ready`` fired, False if the subprocess exited
+    first or the wait timed out. The caller (the /run handler) is responsible
+    for translating False into the right HTTP status by inspecting
+    ``state.status`` and ``state.pipeline_ready``.
+    """
+    fired = _ready_event.wait(timeout=timeout)
+    return fired and _READY_SENTINEL.exists()
 
 
 def stop(state: AppState) -> None:
