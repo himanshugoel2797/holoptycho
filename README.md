@@ -125,12 +125,11 @@ EOF
 
 ### 2. Drop into a dev shell (run from the repo root)
 
-Authenticate once per host: `az login` (Azure) and `tiled login --provider <provider> https://tiled.nsls2.bnl.gov` (Tiled, stores tokens under `~/.config/tiled/`). Then run:
+Run `az login` on the host once. Then run:
 
 ```bash
 docker run --rm -it --gpus all --shm-size=32g --network host \
-  --user "$(id -u):$(id -g)" -v "$PWD":/app -e HOME=/app -w /app \
-  -v "$HOME/.config/tiled:/app/.config/tiled" \
+  --user "$(id -u):$(id -g)" -v "$PWD":/app -e HOME=/tmp -w /app \
   --env-file <(cat <<EOF
 AZURE_TENANT_ID=$(az account show --query tenantId -o tsv)
 AZURE_CLIENT_ID=$(az ad app list --display-name 'NSLS2-Genesis-Holoptycho' --query '[0].appId' -o tsv)
@@ -149,7 +148,7 @@ EOF
 
 The `--env-file <(...)` form pipes Azure secrets through an in-kernel FIFO — they never touch disk and don't show up in `ps`. Each shell entry re-pulls fresh creds from Azure (~5–10s startup); if you'd rather skip Azure when you're just doing env work, drop the `--env-file` block.
 
-Tiled is authenticated through the bind-mounted `~/.config/tiled` instead of `TILED_API_KEY`, so each developer uses their own identity (and personal access) rather than a shared service-account key. Re-run `tiled login` on the host when tokens expire; the container picks up the refreshed tokens on next start.
+Tiled uses your personal identity instead of a shared `TILED_API_KEY` — better audit trail and the right access scope. `HOME` is set to `/tmp` so tokens land at `/tmp/.config/tiled` (outside the mounted repo) and die with the container; run `pixi run tiled login https://tiled.nsls2.bnl.gov` once per dev shell.
 
 ### 3. Build / update the pixi env inside the container
 
