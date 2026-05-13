@@ -125,13 +125,31 @@ EOF
 
 ### 2. Drop into a dev shell (run from the repo root)
 
+Authenticate once per host: `az login` (Azure) and `tiled login --provider <provider> https://tiled.nsls2.bnl.gov` (Tiled, stores tokens under `~/.config/tiled/`). Then run:
+
 ```bash
 docker run --rm -it --gpus all --shm-size=32g --network host \
   --user "$(id -u):$(id -g)" -v "$PWD":/app -e HOME=/app -w /app \
-  cuda-dev bash
+  -v "$HOME/.config/tiled:/app/.config/tiled" \
+  --env-file <(cat <<EOF
+AZURE_TENANT_ID=$(az account show --query tenantId -o tsv)
+AZURE_CLIENT_ID=$(az ad app list --display-name 'NSLS2-Genesis-Holoptycho' --query '[0].appId' -o tsv)
+AZURE_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+AZURE_CERTIFICATE_B64=$(az keyvault secret show --vault-name genesisdemoskv --name holoptycho-sp-cert --query value -o tsv)
+AZURE_RESOURCE_GROUP=rg-genesis-demos
+AZURE_ML_WORKSPACE=genesis-mlw
+TILED_BASE_URL=https://tiled.nsls2.bnl.gov
+SERVER_STREAM_SOURCE=tcp://localhost:5555
+PANDA_STREAM_SOURCE=tcp://localhost:5556
+EOF
+) cuda-dev bash
 ```
 
-`--network host` puts the container in the host's network namespace so the holoscan app can reach host services (ZMQ streams, Tiled, etc.) and bind to ports the host can see. The repo (including `.pixi/`) is mounted at `/app`, so changes made inside the container show up on the host immediately.
+`--network host` puts the container in the host's network namespace so the holoscan app can reach host services (Azure ML / MLflow, Tiled, ZMQ streams) and bind to ports the host can see. The repo (including `.pixi/`) is mounted at `/app`, so changes made inside the container show up on the host immediately.
+
+The `--env-file <(...)` form pipes Azure secrets through an in-kernel FIFO — they never touch disk and don't show up in `ps`. Each shell entry re-pulls fresh creds from Azure (~5–10s startup); if you'd rather skip Azure when you're just doing env work, drop the `--env-file` block.
+
+Tiled is authenticated through the bind-mounted `~/.config/tiled` instead of `TILED_API_KEY`, so each developer uses their own identity (and personal access) rather than a shared service-account key. Re-run `tiled login` on the host when tokens expire; the container picks up the refreshed tokens on next start.
 
 ### 3. Build / update the pixi env inside the container
 
