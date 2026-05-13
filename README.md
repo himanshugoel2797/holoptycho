@@ -14,7 +14,13 @@ One-time setup on the compute node:
 - `az login`, with permissions to read `genesisdemoskv` and pull from `genesisdemosacr`.
 - On slurm / non-systemd hosts, configure `~/.config/containers/storage.conf` for a shared graphroot (template at the top of [`scripts/slurm_start_holoptycho.sh`](scripts/slurm_start_holoptycho.sh)).
 
-Start the container:
+On slurm clusters, first allocate a GPU node:
+
+```bash
+salloc --gres=gpu:1 --mem=64G --cpus-per-gpu=2 --account=staff
+```
+
+Then start the container:
 
 ```bash
 ./start.sh           # foreground — logs stream to the terminal
