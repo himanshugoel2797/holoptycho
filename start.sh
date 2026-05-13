@@ -65,7 +65,7 @@ run_args=(
   --pull=always
   --gpus all
   --shm-size=32g
-  -p "127.0.0.1:${HOST_PORT}:8000"
+  --network host
   -e AZURE_TENANT_ID
   -e AZURE_CLIENT_ID
   -e AZURE_SUBSCRIPTION_ID
