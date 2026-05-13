@@ -1,12 +1,63 @@
 # Holoptycho
 
-Real-time streaming ptychographic reconstruction using [NVIDIA Holoscan](https://developer.nvidia.com/holoscan-sdk), developed for the HXN beamline at NSLS-II.
-
-## Scope
-
-**Holoptycho is for real-time streaming reconstruction only.** It consumes live detector data via ZMQ and emits results to a Tiled catalog as the scan runs.
+Real-time streaming ptychographic reconstruction using [NVIDIA Holoscan](https://developer.nvidia.com/holoscan-sdk), developed for the HXN beamline at NSLS-II. **Holoptycho is for real-time streaming reconstruction only** — it consumes live detector data via ZMQ and emits results to a Tiled catalog as the scan runs.
 
 For batch/offline reconstruction of completed scans, use [`NSLS2/ptycho`](https://github.com/NSLS2/ptycho) or [`NSLS2/ptychoml`](https://github.com/NSLS2/ptychoml) directly.
+
+---
+
+## Container deployment
+
+A Docker image is built and pushed to Azure Container Registry on every merge to main. See [`.github/workflows/build-container.yml`](.github/workflows/build-container.yml).
+
+One-time setup on the compute node:
+- `az login`, with permissions to read `genesisdemoskv` and pull from `genesisdemosacr`.
+- On slurm / non-systemd hosts, configure `~/.config/containers/storage.conf` for a shared graphroot (template at the top of [`scripts/slurm_start_holoptycho.sh`](scripts/slurm_start_holoptycho.sh)).
+
+Start the container:
+
+```bash
+./start.sh           # foreground — logs stream to the terminal
+./start.sh -d        # detached — script prints the logs/stop commands and exits
+```
+
+[`start.sh`](start.sh) does the ACR podman login (the cluster runs rootless podman, so we use `az acr login --expose-token` to pass a token directly to `podman login`), pulls secrets fresh from Key Vault, and starts the container with all the runtime env vars wired in. The API binds to `127.0.0.1:8000` on the host only — see [Connect via SSH tunnel](#connect-via-ssh-tunnel) for remote access.
+
+### Connect via SSH tunnel
+
+The API binds to `127.0.0.1:8000` (localhost only). For remote access, open an SSH tunnel:
+
+```bash
+ssh -L 8000:localhost:8000 <user>@<host>
+```
+
+---
+
+## Development container
+
+On hosts with a glibc too old to run the pixi env directly (e.g. older RHEL), use [`start_dev.sh`](start_dev.sh) to drop into a minimal CUDA+pixi container with the repo bind-mounted. Edit, commit, and push from the host as normal; only run code inside the container.
+
+```bash
+./start_dev.sh
+```
+
+The first run builds a small `cuda-dev` image (nvidia/cuda runtime + pixi) — about a minute. Subsequent runs reuse it. Inside the shell:
+
+```bash
+pixi install                                          # first time / after pixi.lock changes
+pixi run tiled login https://tiled.nsls2.bnl.gov      # once per dev shell
+export ENGINE_CACHE_DIR=/tmp/models
+pixi run api
+```
+
+Why this works:
+- `--network host` so the holoscan app reaches host services (Azure ML / MLflow, Tiled, ZMQ streams) as if it were running on the host.
+- The whole repo (incl. `.pixi/`) is bind-mounted at `/app`, so host-side edits show up inside immediately.
+- `HOME=/tmp` keeps caches and tiled tokens out of the mounted repo; they die with `--rm`.
+- Azure secrets are piped via `--env-file <(...)` — an in-kernel FIFO — so they never touch disk and don't appear in `ps`.
+- Tiled uses your personal identity (via `tiled login`) instead of a shared `TILED_API_KEY`, so you get the right access scope and a real audit trail.
+
+Always run `pixi install` **inside** the dev container, never on the host — that way the env's binaries link against the container's glibc, which is what they run against in production. If you previously ran `pixi install` on the host, delete `.pixi/` and re-install inside the container the first time so nothing is stale.
 
 ---
 
@@ -47,121 +98,6 @@ The pipeline will refuse to start if any of `SERVER_STREAM_SOURCE`, `PANDA_STREA
 | `SERVER_PUBLIC_KEY` | CurveZMQ public key of the [holoscan-proxy](https://github.com/NSLS2/holoscan-proxy). Required only if the proxy is configured with `encrypt: true`. |
 | `CLIENT_PUBLIC_KEY` | CurveZMQ public key of this client. Required if `SERVER_PUBLIC_KEY` is set. |
 | `CLIENT_SECRET_KEY` | CurveZMQ secret key of this client. Required if `SERVER_PUBLIC_KEY` is set. |
-
----
-
-## Container deployment
-
-A Docker image is built and pushed to Azure Container Registry on every merge to main. See [`.github/workflows/build-container.yml`](.github/workflows/build-container.yml).
-
-### 1. Log in to Azure and ACR
-
-```bash
-az login
-```
-
-### 2. Extra step on slurm.
-
-> ```bash
-> export XDG_RUNTIME_DIR=/tmp/podman-run-$(id -u)
-> mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
-> ```
-
-```bash
-# az acr login normally hands a token to the Docker daemon, but this cluster
-# uses rootless podman (no daemon). --expose-token prints the token instead
-# so we can pass it directly to podman login.
-podman login genesisdemosacr.azurecr.io \
-  --username 00000000-0000-0000-0000-000000000000 \
-  --password "$(az acr login --name genesisdemosacr --expose-token --query accessToken -o tsv)"
-```
-
-### 3. Run the container
-
-```bash
-docker run --pull=always --gpus all -p 127.0.0.1:8000:8000 --shm-size=32g \
-  -e AZURE_TENANT_ID="$(az account show --query tenantId -o tsv)" \
-  -e AZURE_CLIENT_ID="$(az ad app list --display-name 'NSLS2-Genesis-Holoptycho' --query '[0].appId' -o tsv)" \
-  -e AZURE_SUBSCRIPTION_ID="$(az account show --query id -o tsv)" \
-  -e AZURE_CERTIFICATE_B64="$(az keyvault secret show --vault-name genesisdemoskv --name holoptycho-sp-cert --query value -o tsv)" \
-  -e AZURE_RESOURCE_GROUP=rg-genesis-demos \
-  -e AZURE_ML_WORKSPACE=genesis-mlw \
-  -e TILED_BASE_URL="https://tiled.nsls2.bnl.gov" \
-  -e TILED_API_KEY="$(az keyvault secret show --vault-name genesisdemoskv --name holoptycho-tiled-api-key --query value -o tsv)" \
-  -e HOLOPTYCHO_LOG_LEVEL="DEBUG" \
-  -e SERVER_STREAM_SOURCE="tcp://localhost:5555" \
-  -e PANDA_STREAM_SOURCE="tcp://localhost:5556" \
-  genesisdemosacr.azurecr.io/holoptycho:latest
-```
-
-The private key is never written to disk. The server binds to `0.0.0.0:8000` inside the container, exposed only on `127.0.0.1:8000` of the host.
-
-
-### 4. Connect via SSH tunnel
-
-The API server binds to `127.0.0.1:8000` (localhost only). For remote access, open an SSH tunnel:
-
-```bash
-ssh -L 8000:localhost:8000 <user>@<host>
-```
-
----
-
-## Development container
-
-On hosts with a glibc too old to run the pixi env directly (e.g. older RHEL), use a minimal CUDA+pixi container as a runtime shell. Edit, commit, and push from the host as normal; only run code inside the container.
-
-### 1. Build the dev image (one-time)
-
-```bash
-docker build -t cuda-dev - <<'EOF'
-FROM nvidia/cuda:12.8.1-runtime-ubuntu22.04
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      libgl1 curl ca-certificates && \
-    rm -rf /var/lib/apt/lists/* && \
-    curl -fsSL https://pixi.sh/install.sh | PIXI_HOME=/usr/local bash
-EOF
-```
-
-### 2. Drop into a dev shell (run from the repo root)
-
-Run `az login` on the host once. Then run:
-
-```bash
-docker run --rm -it --gpus all --shm-size=32g --network host \
-  --user "$(id -u):$(id -g)" -v "$PWD":/app -e HOME=/tmp -w /app \
-  --env-file <(cat <<EOF
-AZURE_TENANT_ID=$(az account show --query tenantId -o tsv)
-AZURE_CLIENT_ID=$(az ad app list --display-name 'NSLS2-Genesis-Holoptycho' --query '[0].appId' -o tsv)
-AZURE_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
-AZURE_CERTIFICATE_B64=$(az keyvault secret show --vault-name genesisdemoskv --name holoptycho-sp-cert --query value -o tsv)
-AZURE_RESOURCE_GROUP=rg-genesis-demos
-AZURE_ML_WORKSPACE=genesis-mlw
-TILED_BASE_URL=https://tiled.nsls2.bnl.gov
-SERVER_STREAM_SOURCE=tcp://localhost:5555
-PANDA_STREAM_SOURCE=tcp://localhost:5556
-EOF
-) cuda-dev bash
-```
-
-`--network host` puts the container in the host's network namespace so the holoscan app can reach host services (Azure ML / MLflow, Tiled, ZMQ streams) and bind to ports the host can see. The repo (including `.pixi/`) is mounted at `/app`, so changes made inside the container show up on the host immediately.
-
-The `--env-file <(...)` form pipes Azure secrets through an in-kernel FIFO — they never touch disk and don't show up in `ps`. Each shell entry re-pulls fresh creds from Azure (~5–10s startup); if you'd rather skip Azure when you're just doing env work, drop the `--env-file` block.
-
-Tiled uses your personal identity instead of a shared `TILED_API_KEY` — better audit trail and the right access scope. `HOME` is set to `/tmp` so tokens land at `/tmp/.config/tiled` (outside the mounted repo) and die with the container; run `pixi run tiled login https://tiled.nsls2.bnl.gov` once per dev shell.
-
-### 3. Build / update the pixi env inside the container
-
-Always run `pixi install` **inside** the dev container, not on the host — that way the env's binaries are linked against the container's glibc, which is what they'll run against in production too. From within the dev shell:
-
-```bash
-pixi install                  # solve / sync .pixi/ from pixi.lock
-pixi shell                    # activate the env in this shell
-# ...or run the API directly:
-pixi run api
-```
-
-If you previously ran `pixi install` on the host, delete `.pixi/` and re-install inside the container the first time so nothing is stale.
 
 ---
 
