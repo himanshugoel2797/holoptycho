@@ -52,6 +52,7 @@ from config_from_tiled import (
     add_reconstruction_arguments,
     build_full_config,
     get_stream,
+    load_config_from_tiled,
     lookup_run,
     open_tiled_node,
 )
@@ -296,6 +297,8 @@ def publish_panda(
     print(f"[panda]  publishing {n_points} positions at {rate_hz} Hz on {endpoint}", flush=True)
 
     frame_number = 0
+    n_msgs_planned = (n_points + points_per_message - 1) // points_per_message
+    last_progress = time.perf_counter()
     for i in range(0, n_points, points_per_message):
         chunk_x = positions_x[i:i + points_per_message]
         chunk_y = positions_y[i:i + points_per_message]
@@ -319,9 +322,17 @@ def publish_panda(
             },
         })
         frame_number += 1
+        now = time.perf_counter()
+        if frame_number % 50 == 0 or now - last_progress >= 1.0:
+            print(
+                f"[panda]  sent {frame_number}/{n_msgs_planned} msgs "
+                f"({frame_number * points_per_message}/{n_points} pts)",
+                flush=True,
+            )
+            last_progress = now
 
     socket.send_json({"msg_type": "stop", "emitted_frames": frame_number})
-    print("[panda]  done", flush=True)
+    print(f"[panda]  done — {frame_number}/{n_msgs_planned} msgs sent", flush=True)
     socket.close()
     context.term()
 
@@ -441,13 +452,52 @@ def setup_scan_from_tiled(
     print(f"  ... fetching head ({head_n} frames) for autodetect", flush=True)
     head_frames = _fetch_frame_chunk(frames_node, frame_axis, skip_frames, skip_frames + head_n)
 
-    positions_x = np.asarray(stream[x_key].read()).ravel().tolist()
-    positions_y = np.asarray(stream[y_key].read()).ravel().tolist()
+    # Real HXN PandA emits 10 encoder samples per detector frame, and the
+    # pipeline averages them back to one position per frame. Tiled storage
+    # is inconsistent across scans — some hold the raw 10× samples, some
+    # hold the already-averaged 1× values. We detect the ratio here and
+    # forward it as `panda_upsample` in the hp config so the pipeline's
+    # averaging stride matches what we publish (no redundant replicate+
+    # average dance).
+    positions_x = np.asarray(stream[x_key].read()).ravel()
+    positions_y = np.asarray(stream[y_key].read()).ravel()
     upsample = max(1, len(positions_x) // n_total)
     pos_start = skip_frames * upsample
     pos_end = end_frame * upsample
     positions_x = positions_x[pos_start:pos_end]
     positions_y = positions_y[pos_start:pos_end]
+
+    # Unit conversion. The pipeline's PointProcessorOp expects raw encoder
+    # counts on the wire (real HXN PandA's native format) and applies
+    # ``x_ratio`` (= -x_scale_factor µm/count, typically ~1e-5) to get
+    # position in µm. When tiled has the raw inenc2_val/inenc3_val keys
+    # (magnitude ~1e4–1e5), publish as-is. When only zpssx/zpssy is
+    # available (motor user_readback in **micrometers**, magnitude single-
+    # digit µm), the pipeline's ``* x_ratio`` mangles those values down
+    # by ~10⁴, clustering all frames at canvas center — the "tiny dot"
+    # mosaic. Convert back to count-space so the pipeline's math lands at
+    # the right µm value: count = um / (x_ratio * x_direction). Detect
+    # by magnitude: HXN encoder counts are easily > 1e3, motor readback
+    # in µm is < 1e3 for any plausible nano-stage scan.
+    if np.abs(positions_x).max() < 1e3 or np.abs(positions_y).max() < 1e3:
+        cfg = load_config_from_tiled(run_uid, tiled_url=tiled_url)
+        x_ratio = float(cfg["x_ratio"])
+        y_ratio = float(cfg["y_ratio"])
+        x_direction = float(cfg["x_direction"])
+        y_direction = float(cfg["y_direction"])
+        x_scale = x_ratio * x_direction
+        y_scale = y_ratio * y_direction
+        print(
+            f"  ... tiled positions look like motor readback in µm "
+            f"(max |x|={np.abs(positions_x).max():.3f}); converting to encoder "
+            f"counts via um / (x_ratio * x_direction)",
+            flush=True,
+        )
+        positions_x = positions_x / x_scale
+        positions_y = positions_y / y_scale
+
+    positions_x = positions_x.tolist()
+    positions_y = positions_y.tolist()
 
     if skip_frames or max_frames is not None:
         print(f"Skipping first {skip_frames} frames; will publish {n_publish} frames "
@@ -464,6 +514,7 @@ def setup_scan_from_tiled(
         "head_frames": head_frames,
         "positions_x": positions_x,
         "positions_y": positions_y,
+        "panda_upsample": upsample,
     }
 
 
@@ -564,7 +615,7 @@ def _json_request(
         raise RuntimeError(f"failed to reach holoptycho API at {url}: {exc.reason}") from exc
 
 
-def start_holoptycho_pipeline(args) -> None:
+def start_holoptycho_pipeline(args, panda_upsample: int = 1) -> None:
     """Start or restart the holoptycho pipeline with config from the same run."""
     hp_url = args.hp_url.rstrip("/")
     try:
@@ -574,6 +625,7 @@ def start_holoptycho_pipeline(args) -> None:
         print(f"[holoptycho] WARNING: failed to clear logs: {exc}", flush=True)
     config_tiled_url = args.hp_config_tiled_url or args.tiled_url
     config = build_full_config(args.uid, tiled_url=config_tiled_url, args=args)
+    config["panda_upsample"] = str(int(panda_upsample))
     status = _json_request(f"{hp_url}/status")
     endpoint = "/restart" if status.get("status") in ("starting", "running", "finished", "error") else "/run"
     # Retry-with-backoff for the brief window where a prior runner thread is
@@ -774,7 +826,7 @@ def main():
         )
 
     if args.hp_start:
-        start_holoptycho_pipeline(args)
+        start_holoptycho_pipeline(args, panda_upsample=streams["panda_upsample"])
 
     # Run Eiger and PandA publishers concurrently. The Eiger thread pulls
     # chunks from tiled lazily — first chunk is the already-fetched head,

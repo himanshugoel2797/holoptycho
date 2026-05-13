@@ -661,6 +661,52 @@ from `PtychoViTInferenceOp`, the chunking loop is misbehaving — check that
   dashboard hangs. Kill any running replay (`pkill -f replay_from_tiled`)
   before launching a new one.
 
+* **`panda_upsample` (config field, default 1) — raw encoder samples per
+  detector frame.** `PointProcessorOp` averages each group of this many raw
+  PandA samples down to one position. Replays of pre-averaged tiled data
+  use 1 (no averaging); the replay script auto-detects the ratio from
+  `len(encoder_array) // n_frames` and forwards it via the hp config. The
+  beamline's prod config is currently set to 10, matching a historical
+  assumption that HXN PandA oversamples 10×. **Open question:** the 10×
+  story hasn't been verified against current PandA firmware — if the real
+  beamline emits 1:1 or some other ratio today, position averaging is
+  either redundant or wrong. Worth confirming with the beamline team and
+  potentially reducing pipeline complexity.
+
+* **`auto_center_dp` (config field, default `true`) — one-shot diffraction
+  centering via scipy segmentation.** `ImagePreprocessorOp` averages the
+  first batch (typically 64 frames), masks hot pixels at detector
+  saturation, thresholds at 5% of peak, runs `scipy.ndimage.label` to find
+  connected components, takes the centroid of the largest one, and shifts
+  every subsequent batch (and the intensity tap) so that centroid lands
+  at the canvas centre. Averaging over the first batch protects against
+  the odd empty/saturated first frame. If no object passes the threshold
+  (truly blank first batch), no shift is applied. Set to `false` if the
+  operator has already centered manually via `batch_x0`/`batch_y0`.
+
+* **`mosaic_overshoot_factor` (config field, default 1.2) — canvas safety
+  margin for the ViT mosaic.** Sized as `max(observed_range, commanded_range
+  × overshoot)`. 1.2 means the canvas is 20% bigger than the commanded
+  scan extent — fine for scans where encoders stay near commanded. HXN
+  scans with settling-row overshoot (e.g. 404611: commanded 2 µm → observed
+  6 µm) need a larger value (3.0). Off-canvas frames are dropped with a
+  warning, so under-sizing degrades the mosaic but doesn't crash the run.
+
+* **`frame_write_stride` (config field, default 1000 for `recon_mode='vit'`,
+  else 1) — detector-frame downsampling for tiled writes.** Persisting every
+  detector frame is ~1 MB per 64-frame patch over WAN — fine for fine-tuning
+  runs (`recon_mode='iterative'` or `'both'`), wasteful for ViT-only spot
+  checks where the operator only needs to confirm preprocessing looks right.
+  `<run>/diffraction/dp` is allocated at `(n_keep, H, W)` where `n_keep =
+  (nz - 1) // stride + 1`; only frames where `frame_idx % stride == 0` are
+  kept, and they map to compact rows via `row = frame_idx // stride`. The
+  stride is stamped in run metadata as `dp_stride` so the dashboard can
+  label its detector tile ("frame 39000 · 1 of every 1000 frames") and
+  consumers can recover the scan-frame number from a row index. Set
+  `frame_write_stride=1` in the config to capture every frame regardless of
+  recon_mode (required if the run will be used as a ptycho-vit fine-tuning
+  sample).
+
 * **Use `--skip-frames` for scans with settling/ramp-up rows.** Some HXN
   scans (e.g. 404611) have the first ~10 rows where encoder readings
   overshoot the commanded scan range by 2–3×. The iterative recon's

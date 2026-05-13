@@ -357,6 +357,8 @@ class PositionRxOp(Operator):
         self.socket = socket
 
         self._first_message_logged = False
+        self._msgs_received = 0
+        self._last_progress_frame = -1
 
     def flush(self,param):
         self.data_x_str = param[0]
@@ -364,20 +366,31 @@ class PositionRxOp(Operator):
 
     def setup(self, spec: OperatorSpec):
         spec.output("pointRx_out")
-        
+
     def compute(self, op_input, op_output, context):
         try:
             msg = self.socket.recv_json()
             if msg["msg_type"] == "data":
                 frame_number = msg["frame_number"]
                 if not self._first_message_logged:
-                    self.logger.debug(
-                        "First PandA data message received: frame_number=%d from %s",
+                    self.logger.info(
+                        "PositionRxOp: first PandA data msg frame_number=%d from %s",
                         frame_number,
                         self.endpoint,
                     )
                     self._first_message_logged = True
-                
+                self._msgs_received += 1
+                if (
+                    self._msgs_received % 50 == 0
+                    or frame_number - self._last_progress_frame >= 50
+                ):
+                    self.logger.info(
+                        "PositionRxOp: received %d msgs, latest frame_number=%d",
+                        self._msgs_received,
+                        frame_number,
+                    )
+                    self._last_progress_frame = frame_number
+
                 x = msg["datasets"][self.data_x_str]["data"]
                 y = msg["datasets"][self.data_y_str]["data"]
                 # idx_start = msg["datasets"][self.data_x_str]["starting_sample_number"]
@@ -393,6 +406,15 @@ class PositionRxOp(Operator):
                 # index = np.arange(idx_start, idx_start + final_size)      
                 # std_err_print(f"{index[:10]=}")
                 op_output.emit((frame_number,np.array([x, y])), "pointRx_out")
+            elif msg["msg_type"] == "stop":
+                self.logger.info(
+                    "PositionRxOp: stop msg received after %d data msgs, "
+                    "emitted_frames=%s",
+                    self._msgs_received,
+                    msg.get("emitted_frames"),
+                )
+            elif msg["msg_type"] == "start":
+                self.logger.info("PositionRxOp: start msg received from %s", self.endpoint)
         except zmq.error.Again:
             # ZMQ poll timeout — no message this tick. See note in EigerZmqRxOp.
             pass

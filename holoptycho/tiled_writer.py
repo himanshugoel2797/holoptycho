@@ -85,6 +85,11 @@ class TiledWriter:
         # fine_tune writes are enabled.
         self._dp_node = None
         self._dp_chunk_size = 0
+        # ViT inference output buffer (sibling to dp; same stride).
+        self._inference_node = None
+        # ViT mosaic node, set by the first write_vit_mosaic so subsequent
+        # patch_vit_mosaic calls don't have to re-walk the container.
+        self._vit_mosaic_node = None
         logger.info("TiledWriter connected: %s / %s", base_url, catalog_path)
 
     # ------------------------------------------------------------------
@@ -107,6 +112,12 @@ class TiledWriter:
             access_tags=_ACCESS_TAGS,
         )
         self._run_uid = run_uid
+        # Reset cached array nodes so they don't point at the previous run's
+        # subcontainers.
+        self._dp_node = None
+        self._dp_chunk_size = 0
+        self._inference_node = None
+        self._vit_mosaic_node = None
         logger.info("TiledWriter.start_run uid=%s metadata=%s", run_uid, meta)
 
     # ------------------------------------------------------------------
@@ -211,19 +222,28 @@ class TiledWriter:
 
     def start_diffraction_buffer(
         self,
-        nz: int,
+        n_keep: int,
         frame_shape: tuple[int, int],
         dtype=np.uint8,
         frames_per_chunk: int = 64,
+        stride: int = 1,
     ) -> None:
         """Register the per-run diffraction buffer structure for fine-tuning data.
 
-        Registers a ``(nz, H, W)`` array under ``<run>/diffraction/dp`` *without*
-        uploading any data. Tiled records the array shape, dtype, and chunking
-        immediately; chunks are populated lazily by ``write_diffraction_chunk``
-        as frames arrive. The register-then-write-blocks split is essential —
-        the alternative ``write_array(np.zeros(...))`` path would upload the
-        whole zero buffer up front, which times out over WAN.
+        Registers a ``(n_keep, H, W)`` array under ``<run>/diffraction/dp``
+        *without* uploading any data. Tiled records the array shape, dtype, and
+        chunking immediately; chunks are populated lazily by
+        ``write_diffraction_chunk`` as frames arrive. The register-then-write-
+        blocks split is essential — the alternative
+        ``write_array(np.zeros(...))`` path would upload the whole zero buffer
+        up front, which times out over WAN.
+
+        ``stride`` controls the row-to-scan-frame mapping: row ``r`` of dp
+        holds scan frame ``r * stride``. ``n_keep`` is the count of kept
+        frames (= ``(nz - 1) // stride + 1``). For ``stride=1`` (default) the
+        buffer is dense, ``n_keep == nz``, and behaviour matches the original
+        write-every-frame semantics. The stride is stamped into run metadata
+        as ``dp_stride`` so consumers can recover the mapping.
 
         ``dp`` stores **amplitude** (= ``sqrt(intensity)``, rounded to uint8)
         rather than raw uint16 intensity. The Eiger detector is 16-bit but
@@ -234,10 +254,6 @@ class TiledWriter:
         a 10K frame 256×256 scan) since Tiled's ``write_block`` does not
         accept compressed payloads. ptycho-vit's Tiled-backed loader expects
         this amplitude form and skips its own sqrt step on this data path.
-
-        Chunking is set so each block holds ``frames_per_chunk`` whole frames
-        (the natural batch boundary from ``ImageBatchOp``). Each
-        ``write_diffraction_chunk`` call writes exactly one block.
         """
         if self._run is None:
             logger.warning("start_diffraction_buffer before start_run; skipping")
@@ -251,15 +267,20 @@ class TiledWriter:
             h, w = int(frame_shape[0]), int(frame_shape[1])
             dtype_np = np.dtype(dtype)
 
-            # Frame chunking matches ImageBatchOp's batch size so each
-            # FrameWriterOp invocation maps to exactly one block_id.
-            n_full = nz // frames_per_chunk
-            rem = nz - n_full * frames_per_chunk
-            chunk_dim0 = (frames_per_chunk,) * n_full
+            # Chunking matches ImageBatchOp's batch size when stride=1 so each
+            # FrameWriterOp invocation maps to exactly one block_id. For
+            # large strides n_keep can be tiny (e.g. 40 rows for stride=1000
+            # on a 40K-frame scan); clamp chunk_dim0 to n_keep so we don't
+            # create a zero-row tail block.
+            chunk0 = min(int(frames_per_chunk), int(n_keep))
+            chunk0 = max(1, chunk0)
+            n_full = n_keep // chunk0
+            rem = n_keep - n_full * chunk0
+            chunk_dim0 = (chunk0,) * n_full
             if rem:
                 chunk_dim0 = chunk_dim0 + (rem,)
             structure = ArrayStructure(
-                shape=(int(nz), h, w),
+                shape=(int(n_keep), h, w),
                 chunks=(chunk_dim0, (h,), (w,)),
                 data_type=BuiltinDtype.from_numpy_dtype(dtype_np),
             )
@@ -279,71 +300,175 @@ class TiledWriter:
                 specs=_SPECS,
                 access_tags=_ACCESS_TAGS,
             )
-            self._dp_chunk_size = int(frames_per_chunk)
+            self._dp_chunk_size = int(chunk0)
+            self._dp_stride = int(stride)
+            self._run.update_metadata(metadata={"dp_stride": int(stride)})
             logger.info(
                 "TiledWriter.start_diffraction_buffer run=%s shape=(%d,%d,%d) "
-                "dtype=%s chunks=%d frames",
-                self._run_uid, nz, h, w, dtype_np, frames_per_chunk,
+                "dtype=%s chunks=%d frames stride=%d",
+                self._run_uid, n_keep, h, w, dtype_np, chunk0, stride,
             )
         except Exception:
             logger.exception("TiledWriter.start_diffraction_buffer failed")
             self._dp_node = None
             self._dp_chunk_size = 0
+            self._dp_stride = 1
 
     def write_diffraction_chunk(
         self,
-        indices: np.ndarray,
+        rows: np.ndarray,
         frames: np.ndarray,
     ) -> None:
         """Write a chunk of detector-frame intensity into ``<run>/diffraction/dp``.
 
-        ``indices`` is a ``(B,)`` array of global frame indices in scan order;
-        ``frames`` is ``(B, H, W)`` of intensity (any uint dtype is accepted
-        — upstream ``ImageBatchOp`` allocates uint32 for arithmetic headroom).
+        ``rows`` is a ``(B,)`` array of compact-dp row indices (not global
+        scan-frame numbers); ``frames`` is ``(B, H, W)`` of intensity (any
+        uint dtype is accepted — upstream ``ImageBatchOp`` allocates uint32).
         Frames are sqrt'd and cast to uint8 before write to halve the wire
         volume vs uint16; see ``start_diffraction_buffer`` for justification.
 
-        We write one block per call. Misaligned or non-contiguous chunks are
-        skipped with a warning — block writes require batch boundaries to
-        match the chunk boundaries declared at registration.
+        With ``stride=1`` rows == global frame indices (dense case). With
+        stride > 1 the caller has filtered batches down to kept frames and
+        mapped each to its compact row (``row = frame // stride``); the
+        writer is row-index agnostic.
+
+        Uses ``ArrayClient.patch(data, offset=(row_start, 0, 0))`` rather than
+        ``write_block``: the upstream batch boundary doesn't need to align to
+        the on-disk chunk grid. This matters because **a single dropped frame
+        mid-stream permanently desynchronises ImageBatchOp's counter** — the
+        next batch starts at a non-aligned offset and stays non-aligned. With
+        block writes that loses every subsequent batch (observed: 30000 of
+        40000 frames lost from one ZMQ HWM-overflow drop). ``patch`` lands at
+        the exact row offset; gaps stay as the buffer's zero-init.
         """
         if self._dp_node is None:
             return
         try:
-            indices = np.asarray(indices)
-            if len(indices) == 0:
+            rows = np.asarray(rows)
+            if len(rows) == 0:
                 return
-            start = int(indices[0])
-            n = len(indices)
-            chunk_size = getattr(self, "_dp_chunk_size", 0) or n
-            if start % chunk_size != 0:
-                logger.warning(
-                    "write_diffraction_chunk: misaligned start=%d "
-                    "(chunk_size=%d); skipping",
-                    start, chunk_size,
-                )
-                return
-            if not np.all(np.diff(indices) == 1):
-                logger.warning(
-                    "write_diffraction_chunk: non-contiguous indices "
-                    "[%d..%d]; skipping",
-                    start, int(indices[-1]),
-                )
-                return
-            block_id = (start // chunk_size, 0, 0)
-            # Convert intensity → amplitude → uint8 to match the declared
-            # dtype at start_diffraction_buffer and halve the wire volume vs
-            # uint16. Upstream emits uint32 with values in the uint16 detector
-            # range; sqrt(65535) ≈ 256 fits cleanly in uint8 (we just clip
-            # the very rare overflow). The 1-count quantization is well below
-            # the Poisson noise floor for ML training.
             intensity = np.asarray(frames)
             amp = np.sqrt(intensity, dtype=np.float32)
             np.clip(amp, 0, 255, out=amp)
-            amp_u8 = amp.astype(np.uint8, copy=False)
-            self._dp_node.write_block(np.ascontiguousarray(amp_u8), block=block_id)
+            amp_u8 = np.ascontiguousarray(amp.astype(np.uint8, copy=False))
+
+            start = int(rows[0])
+            if np.all(np.diff(rows) == 1):
+                # Contiguous rows — one patch covering [start, start+B).
+                self._dp_node.patch(amp_u8, offset=(start, 0, 0))
+            else:
+                # Non-contiguous rows. Per-row patches so we don't corrupt
+                # slots between the present rows. Common when stride > 1 and
+                # a batch happens to span two stride boundaries.
+                logger.warning(
+                    "write_diffraction_chunk: non-contiguous rows "
+                    "[%d..%d] (n=%d); writing per-row",
+                    start, int(rows[-1]), len(rows),
+                )
+                for i, r in enumerate(rows):
+                    self._dp_node.patch(amp_u8[i:i + 1], offset=(int(r), 0, 0))
         except Exception:
             logger.exception("TiledWriter.write_diffraction_chunk failed")
+
+    def start_inference_buffer(
+        self,
+        n_keep: int,
+        frame_shape: tuple[int, int],
+        dtype=np.float32,
+        n_channels: int = 2,
+        frames_per_chunk: int = 64,
+        stride: int = 1,
+    ) -> None:
+        """Register the per-run ViT inference buffer at ``<run>/diffraction/inference``.
+
+        Sibling to ``start_diffraction_buffer``: same compact row layout
+        keyed by ``stride``, but stores the model's full ``(n_channels, H, W)``
+        prediction per kept frame (typically ``n_channels=2`` for amp+phase).
+        Row r holds the inference output for scan frame ``r * stride`` — the
+        same scan frame whose detector data lives at ``dp[r]``.
+
+        Float32 because the model outputs are unbounded reals near 0; uint
+        quantisation would clip useful dynamic range. For stride=1000 on a
+        40K-frame scan the buffer is only ~21 MB, so the cost is negligible.
+        """
+        if self._run is None:
+            logger.warning("start_inference_buffer before start_run; skipping")
+            return
+        try:
+            from tiled.structures.array import ArrayStructure, BuiltinDtype
+            from tiled.structures.core import StructureFamily
+            from tiled.structures.data_source import DataSource
+
+            diffraction = _get_or_create(self._run, "diffraction")
+            h, w = int(frame_shape[0]), int(frame_shape[1])
+            dtype_np = np.dtype(dtype)
+            nc = int(n_channels)
+
+            chunk0 = min(int(frames_per_chunk), int(n_keep))
+            chunk0 = max(1, chunk0)
+            n_full = n_keep // chunk0
+            rem = n_keep - n_full * chunk0
+            chunk_dim0 = (chunk0,) * n_full
+            if rem:
+                chunk_dim0 = chunk_dim0 + (rem,)
+            structure = ArrayStructure(
+                shape=(int(n_keep), nc, h, w),
+                chunks=(chunk_dim0, (nc,), (h,), (w,)),
+                data_type=BuiltinDtype.from_numpy_dtype(dtype_np),
+            )
+            data_source = DataSource(
+                structure=structure,
+                structure_family=StructureFamily.array,
+            )
+            if "inference" in diffraction:
+                del diffraction["inference"]
+            self._inference_node = diffraction.new(
+                StructureFamily.array,
+                [data_source],
+                key="inference",
+                specs=_SPECS,
+                access_tags=_ACCESS_TAGS,
+            )
+            logger.info(
+                "TiledWriter.start_inference_buffer run=%s shape=(%d,%d,%d,%d) "
+                "dtype=%s stride=%d",
+                self._run_uid, n_keep, nc, h, w, dtype_np, stride,
+            )
+        except Exception:
+            logger.exception("TiledWriter.start_inference_buffer failed")
+            self._inference_node = None
+
+    def write_inference_chunk(
+        self,
+        rows: np.ndarray,
+        preds: np.ndarray,
+    ) -> None:
+        """Write ``(B, n_channels, H, W)`` predictions at compact rows in dp/inference.
+
+        Mirrors ``write_diffraction_chunk`` shape-wise (contiguous → one
+        patch, non-contiguous → per-row patches). Cast to float32 to match
+        the buffer's declared dtype.
+        """
+        if getattr(self, "_inference_node", None) is None:
+            return
+        try:
+            rows = np.asarray(rows)
+            if len(rows) == 0:
+                return
+            arr = np.ascontiguousarray(np.asarray(preds, dtype=np.float32))
+            start = int(rows[0])
+            if np.all(np.diff(rows) == 1):
+                self._inference_node.patch(arr, offset=(start, 0, 0, 0))
+            else:
+                logger.warning(
+                    "write_inference_chunk: non-contiguous rows "
+                    "[%d..%d] (n=%d); writing per-row",
+                    start, int(rows[-1]), len(rows),
+                )
+                for i, r in enumerate(rows):
+                    self._inference_node.patch(arr[i:i + 1], offset=(int(r), 0, 0, 0))
+        except Exception:
+            logger.exception("TiledWriter.write_inference_chunk failed")
 
     def write_probe_positions_m(
         self,
@@ -366,6 +491,25 @@ class TiledWriter:
             self._write_or_overwrite_array(diffraction, "probe_position_y_m", y_m)
         except Exception:
             logger.exception("TiledWriter.write_probe_positions_m failed")
+
+    def update_dp_progress(self, n_written: int) -> None:
+        """Stamp ``dp_frames_written: n_written`` into the run's metadata.
+
+        Distinct from ``positions_um`` filled-count: ``PositionsWriterOp``
+        writes the whole positions array per batch (cheap), while
+        ``FrameWriterOp`` writes ~1 MB per 64-frame patch (slow over WAN),
+        so dp can lag positions by tens of thousands of frames during a
+        fast scan. The dashboard's frame slider needs to know the *dp*
+        progress to clamp its max — otherwise users scroll past actual
+        data into the buffer's zero-init.
+        """
+        if self._run is None:
+            logger.warning("update_dp_progress before start_run; skipping")
+            return
+        try:
+            self._run.update_metadata(metadata={"dp_frames_written": int(n_written)})
+        except Exception:
+            logger.exception("TiledWriter.update_dp_progress failed")
 
     def mark_run_complete(self) -> None:
         """Stamp ``complete: true`` into the per-run container metadata.
@@ -428,11 +572,13 @@ class TiledWriter:
         pixel_size_m: float,
         canvas_origin_um: tuple[float, float],
     ) -> None:
-        """Overwrite the server-side ViT mosaic for the current run.
+        """Overwrite the entire server-side ViT mosaic for the current run.
 
-        Written under ``<run>/vit/mosaic`` so the dashboard can render it with
-        the same TiledImageTile path used for the iterative live object,
-        rather than re-stitching per-batch in the browser.
+        Used for the first write of each scan to seed the canvas (including
+        the fill colour applied to never-stitched regions). Incremental
+        per-batch updates after that go through ``patch_vit_mosaic``, which
+        only sends the bounding box of the newly-placed patches and is
+        ~30-100× cheaper over WAN.
         """
         if self._run is None:
             logger.warning("write_vit_mosaic called before start_run; skipping")
@@ -445,8 +591,45 @@ class TiledWriter:
                 "canvas_origin_um": [float(canvas_origin_um[0]), float(canvas_origin_um[1])],
             }
             self._write_or_overwrite_array(vit, "mosaic", mosaic, metadata=meta)
+            # Cache the array node so subsequent patch() calls don't have to
+            # walk the container path on every batch.
+            self._vit_mosaic_node = vit["mosaic"]
         except Exception:
             logger.exception("TiledWriter.write_vit_mosaic failed")
+
+    def patch_vit_mosaic(
+        self,
+        subregion: np.ndarray,
+        *,
+        offset_yx: tuple[int, int],
+        batch_num: int,
+    ) -> None:
+        """Patch a sub-region of the mosaic in place.
+
+        ``subregion`` is the already-normalised float32 patch (mosaic / counts
+        for the affected bbox). ``offset_yx`` is the top-left corner of that
+        region in canvas pixel coordinates. Sends only the bbox bytes, not
+        the whole 36 MB canvas, so it's the path the live mosaic loop
+        depends on staying ahead of WAN throughput.
+        """
+        if self._run is None:
+            logger.warning("patch_vit_mosaic called before start_run; skipping")
+            return
+        node = getattr(self, "_vit_mosaic_node", None)
+        if node is None:
+            # Caller forgot to seed via write_vit_mosaic first — fall back to
+            # re-fetching, which is still correct, just slower on first call.
+            try:
+                node = self._run["vit"]["mosaic"]
+                self._vit_mosaic_node = node
+            except Exception:
+                logger.exception("patch_vit_mosaic: failed to resolve mosaic node")
+                return
+        try:
+            node.patch(np.ascontiguousarray(subregion), offset=(int(offset_yx[0]), int(offset_yx[1])))
+            node.update_metadata(metadata={"batch_num": int(batch_num)})
+        except Exception:
+            logger.exception("TiledWriter.patch_vit_mosaic failed")
 
 # Module-level singleton — shared by all callers within the same process.
 _writer_instance: "TiledWriter | None" = None

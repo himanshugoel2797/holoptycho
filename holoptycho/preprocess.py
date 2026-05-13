@@ -105,12 +105,98 @@ class ImagePreprocessorOp(Operator):
         # self.roi = np.array(roi)
         self.detmap_threshold = 0
         self.badpixels = None
+        # Once-per-run auto-centering. Computed on the average of the first
+        # batch via scipy connected-component segmentation; same shift then
+        # applied to every subsequent batch. ``None`` = not yet computed,
+        # ``False`` = disabled by config. See ``_compute_centering_shift``.
+        self.auto_center = True
+        self._center_shift: tuple[int, int] | None = None
+        # Extra transpose on the model-input branch, applied AFTER rot90 +
+        # fftshift. Historical (was commented out); re-enabled as a knob
+        # because some training runs expected the transposed orientation
+        # and feeding the wrong one yields garbage predictions. Affects
+        # only the model input — the intensity tap (saved dp) stays in
+        # detector orientation.
+        self.dp_transpose = True
         super().__init__(*args, **kwargs)
 
         # Per-second compute() throughput counters. See note in EigerZmqRxOp.
         self._diag_window_start = time.time()
         self._diag_calls = 0
         self._diag_total_ms = 0.0
+
+    def _compute_centering_shift(self, batch: np.ndarray) -> tuple[int, int]:
+        """Segmentation-based one-shot centering offset.
+
+        Averages the input batch (typically 64 frames; protects against the
+        odd empty/saturated first frame), masks hot pixels at detector
+        saturation, thresholds at 5% of peak to isolate the diffraction
+        blob, and runs ``scipy.ndimage.label`` to find connected components.
+        The centroid of the largest one is taken as the "scan center"; the
+        returned shift translates that centroid to the canvas centre.
+
+        Falls back to ``(0, 0)`` if no object meets the threshold (e.g.
+        truly empty first batch) — subsequent batches stay un-shifted in
+        that case, matching the un-centered behaviour we had before.
+        """
+        from scipy.ndimage import label, center_of_mass
+
+        avg = batch.astype(np.float32).mean(axis=0)
+        # Saturation mask: pixels at/near uint max are hot/bad and would
+        # bias the centroid. Drop them out of the segmentation input.
+        try:
+            sat = float(np.iinfo(batch.dtype).max) - 1.0
+        except ValueError:
+            sat = float('inf')  # floats — no saturation concept
+        masked = np.where(avg >= sat, 0.0, avg)
+        peak = float(masked.max())
+        if peak <= 0:
+            self.logger.warning(
+                "Auto-centering: average frame has no positive signal; "
+                "skipping shift",
+            )
+            return (0, 0)
+        binary = masked > (0.05 * peak)
+        labels, n_obj = label(binary)
+        if n_obj == 0:
+            self.logger.warning(
+                "Auto-centering: no connected component above 5%% of peak; "
+                "skipping shift",
+            )
+            return (0, 0)
+        # "Find 1 object": largest connected component by pixel count.
+        sizes = np.bincount(labels.ravel())
+        sizes[0] = 0
+        largest = int(np.argmax(sizes))
+        cy, cx = center_of_mass(masked, labels, largest)
+        h, w = batch.shape[1], batch.shape[2]
+        dy = int(round(h / 2.0 - cy))
+        dx = int(round(w / 2.0 - cx))
+        self.logger.info(
+            "Auto-centering: %d component(s) found, largest=%d px at "
+            "(y=%.1f, x=%.1f); shifting batch by (dy=%d, dx=%d)",
+            n_obj, int(sizes[largest]), cy, cx, dy, dx,
+        )
+        return (dy, dx)
+
+    @staticmethod
+    def _apply_shift(batch: np.ndarray, dy: int, dx: int) -> np.ndarray:
+        """Translate every frame in ``batch`` by ``(dy, dx)``; zero-fill the
+        wrap-around band (so we don't bring in random distant intensity).
+        ``np.roll`` is vectorised over the batch dim — much faster than
+        per-frame ``scipy.ndimage.shift``."""
+        if dy == 0 and dx == 0:
+            return batch
+        shifted = np.roll(batch, shift=(dy, dx), axis=(1, 2))
+        if dy > 0:
+            shifted[:, :dy, :] = 0
+        elif dy < 0:
+            shifted[:, dy:, :] = 0
+        if dx > 0:
+            shifted[:, :, :dx] = 0
+        elif dx < 0:
+            shifted[:, :, dx:] = 0
+        return shifted
 
     def setup(self, spec: OperatorSpec):
         spec.input("image_batch").connector(IOSpec.ConnectorType.DOUBLE_BUFFER, capacity=32)
@@ -143,6 +229,17 @@ class ImagePreprocessorOp(Operator):
         # transpose to (K, 2) for inpaint_bad_pixels' coords format.
         inpaint_bad_pixels(processed_images, self.badpixels.T)
 
+        # One-shot segmentation-based centering: compute a (dy, dx) shift
+        # from the first batch's averaged frame, then apply that same shift
+        # to every subsequent batch. Affects both the intensity tap (saved
+        # to tiled <run>/diffraction/dp) and the model input, so what the
+        # operator sees on the dashboard matches what the ViT model sees.
+        if self.auto_center and self._center_shift is None:
+            self._center_shift = self._compute_centering_shift(processed_images)
+        if self._center_shift is not None:
+            dy, dx = self._center_shift
+            processed_images = self._apply_shift(processed_images, dy, dx)
+
         # Tap detector-frame intensity before rot90/fftshift — ptycho-vit's
         # training loader expects intensity in detector orientation. Contiguous
         # copy so downstream rot90 (returns a view) doesn't alias the emitted
@@ -152,7 +249,8 @@ class ImagePreprocessorOp(Operator):
         # processed_images = processed_images[:, self.roi[0,0]:self.roi[0,1], self.roi[1,0]:self.roi[1,1]]
         processed_images = np.rot90(processed_images, axes=(2,1))
         processed_images = np.fft.fftshift(processed_images, axes=(1,2))
-        # processed_images = np.transpose(processed_images,[0,2,1])
+        if self.dp_transpose:
+            processed_images = np.transpose(processed_images, [0, 2, 1])
         if self.detmap_threshold > 0:
             apply_intensity_floor(processed_images, self.detmap_threshold)
         diff_amp = np.sqrt(processed_images, dtype = np.float32 ,order='C')

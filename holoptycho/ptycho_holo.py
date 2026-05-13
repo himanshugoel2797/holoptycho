@@ -377,12 +377,18 @@ class PtychoRecon(Operator):
 # Requires TILED_BASE_URL and TILED_API_KEY; raises RuntimeError otherwise.
 _writer = get_writer()
 
+# Probe amplitudes from the iterative engine come out normalized; ptycho-vit
+# was trained on probes at 256× this scale (the model's fixed 256x256 input
+# size). Multiply on the way out so live snapshots and the final probe land
+# in Tiled at the magnitude downstream consumers expect.
+_PROBE_SCALE = 256.0
+
 @create_op(inputs="results")
 def SaveLiveResult(results):
     try:
         _writer.write_live(
             iteration=results[2],
-            probe=results[0],
+            probe=results[0] * _PROBE_SCALE,
             obj=results[1],
         )
     except Exception:
@@ -393,7 +399,7 @@ def SaveResult(output):
     print('Live recon done! Saving results..')
     engine = output[0]
     _writer.write_final(
-        probe=np.asarray(engine.prb_mode),
+        probe=np.asarray(engine.prb_mode) * _PROBE_SCALE,
         obj=np.asarray(engine.obj_mode),
         timestamps=np.array(output[1]),
         num_points=np.array(output[2]),
@@ -406,20 +412,35 @@ def SaveResult(output):
 
 
 class FrameWriterOp(Operator):
-    """Persist detector-frame intensity to Tiled when config.fine_tune=True.
+    """Persist detector-frame intensity to Tiled.
 
     Subscribes to ImagePreprocessorOp's ``intensity`` tap — chunks of
     ``(B, H, W)`` uint16 in detector-frame orientation (after bad-pixel
-    inpaint, before rot90/fftshift/floor/sqrt). Each chunk is written into
-    ``<run>/diffraction/dp[start:stop]`` via
-    ``TiledWriter.write_diffraction_chunk``. This is the model *input* — what
-    ptycho-vit's training loader consumes — so it has to be intensity in
-    detector orientation, not the rot/shifted amplitude the live ViT op sees.
+    inpaint, before rot90/fftshift/floor/sqrt). Each chunk is filtered on
+    ``stride`` (keep frames where ``frame_idx % stride == 0``), mapped to
+    compact-dp rows (``row = frame_idx // stride``), and patched into
+    ``<run>/diffraction/dp`` via ``TiledWriter.write_diffraction_chunk``.
+
+    For ``stride=1`` (default for iterative/both, opt-in for ViT-only): every
+    frame is written — full fine-tuning capture. For ``stride>1`` (default
+    1000 for ViT-only): only every Nth frame is written, providing
+    spot-check visibility on the dashboard without the WAN cost of writing
+    every frame. The stride is stamped into run metadata as ``dp_stride``
+    so the dashboard can label its detector tile.
     """
 
-    def __init__(self, *args, **kwargs):
+    # Push a dp_frames_written metadata update at most this often. Each update
+    # is a small HTTPS PUT and we don't need realtime — the dashboard polls
+    # the slider state every 2 s anyway. Throttling keeps the metadata
+    # endpoint from drowning under per-batch updates on fast scans.
+    _PROGRESS_UPDATE_INTERVAL_S = 1.0
+
+    def __init__(self, *args, stride: int = 1, **kwargs):
         super().__init__(*args, **kwargs)
+        self._stride = max(1, int(stride))
         self._first_batch = True
+        self._max_row_written = 0
+        self._last_progress_push = 0.0
 
     def setup(self, spec: OperatorSpec):
         spec.input("intensity").connector(IOSpec.ConnectorType.DOUBLE_BUFFER, capacity=32)
@@ -449,7 +470,74 @@ class FrameWriterOp(Operator):
                     "until the pipeline is ready."
                 )
             self._first_batch = False
-        _writer.write_diffraction_chunk(idx_arr, np.asarray(frames))
+
+        if self._stride <= 1:
+            kept_frames = np.asarray(frames)
+            kept_rows = idx_arr
+        else:
+            keep_mask = (idx_arr % self._stride) == 0
+            if not keep_mask.any():
+                return
+            kept_frames = np.asarray(frames)[keep_mask]
+            kept_rows = idx_arr[keep_mask] // self._stride
+
+        _writer.write_diffraction_chunk(kept_rows, kept_frames)
+
+        # Track high-water row index. Dashboard slider clamps against this
+        # via the dp_frames_written metadata so users can't scroll past
+        # actually-written rows.
+        new_max = int(kept_rows[-1]) + 1
+        if new_max > self._max_row_written:
+            self._max_row_written = new_max
+            now = time.time()
+            if now - self._last_progress_push >= self._PROGRESS_UPDATE_INTERVAL_S:
+                _writer.update_dp_progress(self._max_row_written)
+                self._last_progress_push = now
+
+
+class InferenceFrameWriterOp(Operator):
+    """Persist ViT inference output to Tiled, mirroring FrameWriterOp's stride.
+
+    Subscribes to ``vit_inference``'s ``vit_result`` (a tuple of ``(pred,
+    indices)`` with ``pred`` shape ``(B, n_channels, H, W)`` and ``indices``
+    shape ``(B,)``). Keeps the same frames FrameWriterOp keeps (``idx %
+    stride == 0``), maps each to its compact row, and patches
+    ``<run>/diffraction/inference[row]`` with the model's prediction.
+
+    Result: for every frame written to ``<run>/diffraction/dp``, the
+    corresponding model output is stored at the matching row of
+    ``<run>/diffraction/inference``. The dashboard pairs the two tiles via
+    the shared row index.
+    """
+
+    def __init__(self, *args, stride: int = 1, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._stride = max(1, int(stride))
+
+    def setup(self, spec: OperatorSpec):
+        spec.input("results").connector(
+            IOSpec.ConnectorType.DOUBLE_BUFFER, capacity=32
+        )
+
+    def compute(self, op_input, op_output, context):
+        try:
+            results = op_input.receive("results")
+            pred, indices = results
+            idx_arr = np.asarray(indices)
+            if self._stride <= 1:
+                kept_pred = np.asarray(pred)
+                kept_rows = idx_arr
+            else:
+                keep_mask = (idx_arr % self._stride) == 0
+                if not keep_mask.any():
+                    return
+                kept_pred = np.asarray(pred)[keep_mask]
+                kept_rows = idx_arr[keep_mask] // self._stride
+            _writer.write_inference_chunk(kept_rows, kept_pred)
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "InferenceFrameWriterOp.compute failed"
+            )
 
 
 class PtychoApp(Application):
@@ -561,6 +649,17 @@ class PtychoApp(Application):
 
         self.image_batch = ImageBatchOp(self, name="image_batch")
         self.image_proc = ImagePreprocessorOp(self, name="image_proc")
+        # Auto-center the diffraction pattern via scipy segmentation on the
+        # average of the first batch (default on). Set `auto_center_dp=false`
+        # in the config to disable (e.g. if the operator has already set
+        # batch_x0/batch_y0 manually and doesn't want extra refinement).
+        self.image_proc.auto_center = bool(getattr(self.param, "auto_center_dp", True))
+        # Extra `np.transpose([0, 2, 1])` on the model-input branch after
+        # rot90 + fftshift (default on). Some model training runs expected
+        # the transposed orientation; flipping this knob is the fastest way
+        # to test "is the model getting garbage because the orientation is
+        # wrong?". Affects only the model input, not the saved dp.
+        self.image_proc.dp_transpose = bool(getattr(self.param, "dp_transpose", True))
         self.image_send = ImageSendOp(self, name="image_send")
         self.point_proc = PointProcessorOp(
             self,
@@ -592,6 +691,13 @@ class PtychoApp(Application):
         self.point_proc.y_ratio = float(self.param.y_ratio)
         self.point_proc.min_points = num_points_max
         self.point_proc.angle = float(getattr(self.param, 'angle', 0.0))
+        # Number of raw encoder samples per detector frame; PointProcessorOp
+        # averages each group of this many raw samples down to one position.
+        # Default 1 = positions are 1:1 with frames (replays of pre-averaged
+        # tiled data). The real HXN beamline currently emits 10 raw samples
+        # per frame, so its prod config sets panda_upsample=10. Mismatch
+        # leaves positions_um mostly NaN and silently stalls the mosaic.
+        self.point_proc.upsample = int(getattr(self.param, 'panda_upsample', 1))
         self.point_proc.simulate_positions = bool(getattr(self.param, 'simulate_positions', False))
         if self.point_proc.simulate_positions:
             self.point_proc.pos0_simul = np.tile(
@@ -659,17 +765,39 @@ class PtychoApp(Application):
             "complete": False,
         }
         _writer.start_run(self.run_uid, metadata=run_metadata)
-        # Always pre-allocate the diffraction buffer so the dashboard's
-        # detector-frame tile is available on every run, regardless of
-        # recon_mode. Whether a run can be used as a ptycho-vit fine-tuning
-        # sample depends on whether final/probe and final/object are present
-        # — that's only the case when recon_mode is 'iterative' or 'both'.
-        # See TiledWriter.start_diffraction_buffer for the dtype rationale.
+
+        # Detector-frame downsampling. ViT-only runs default to keeping 1
+        # in every 1000 frames (40 frames for a 40K-point scan) — enough
+        # for an operator to spot-check that preprocessing looks right on
+        # the dashboard, without paying the WAN cost of writing every
+        # frame. Iterative/both runs default to stride=1 (every frame)
+        # because final/probe + final/object only mean ptycho-vit can
+        # fine-tune on this run if every frame is present. Explicit
+        # `frame_write_stride` in the config overrides the default.
+        stride_cfg = getattr(self.param, "frame_write_stride", None)
+        if stride_cfg is None:
+            frame_write_stride = 1000 if recon_mode == "vit" else 1
+        else:
+            frame_write_stride = max(1, int(stride_cfg))
+        nz_total = int(x_num * y_num)
+        n_keep = (nz_total - 1) // frame_write_stride + 1
         _writer.start_diffraction_buffer(
-            nz=int(x_num * y_num),
+            n_keep=n_keep,
             frame_shape=(int(self.param.nx), int(self.param.ny)),
             dtype=np.uint8,
+            stride=frame_write_stride,
         )
+        # Sibling inference buffer: for each kept dp row, store the ViT model's
+        # (amp, phase) prediction so the dashboard can pair them. Only wired
+        # when the ViT branch runs ("vit" or "both").
+        if recon_mode in ("vit", "both"):
+            _writer.start_inference_buffer(
+                n_keep=n_keep,
+                frame_shape=(int(self.param.nx), int(self.param.ny)),
+                dtype=np.float32,
+                n_channels=2,
+                stride=frame_write_stride,
+            )
 
         # --- PtychoViT inference (parallel to iterative recon) ---
         # Prefer a second GPU for PyCUDA/TRT when available, but fall back to
@@ -689,12 +817,19 @@ class PtychoApp(Application):
         # Per-batch pred + indices export is gated by the config field
         # vit_batch_writes (default off) — see SaveViTResult docstring.
         enable_batch_writes = bool(getattr(self.param, "vit_batch_writes", False))
+        # Canvas safety margin. 1.2 fits ~83% of the canvas with painted
+        # scan area on a typical 5 µm scan; bump for HXN scans with
+        # settling-row overshoot (e.g. 404611 commanded 2 µm → observed
+        # 6 µm needs ≥3.0). Off-canvas frames trigger a warning in
+        # SaveViTResult and are dropped.
+        mosaic_overshoot = float(getattr(self.param, "mosaic_overshoot_factor", 1.2))
         self.vit_save = SaveViTResult(
             self,
             positions_provider=lambda: self.point_proc.positions_um,
             pixel_size_m=float(self.pty.recon.x_pixel_m),
             x_range_um=float(self.pty.recon.x_range_um),
             y_range_um=float(self.pty.recon.y_range_um),
+            overshoot_factor=mosaic_overshoot,
             enable_batch_writes=enable_batch_writes,
             name="vit_save",
         )
@@ -702,7 +837,11 @@ class PtychoApp(Application):
         self.positions_writer = PositionsWriterOp(self, name="positions_writer")
         if enable_batch_writes:
             self.batch_writer = BatchWriterOp(self, name="batch_writer")
-        self.frame_writer = FrameWriterOp(self, name="frame_writer")
+        self.frame_writer = FrameWriterOp(self, name="frame_writer", stride=frame_write_stride)
+        if recon_mode in ("vit", "both"):
+            self.inference_writer = InferenceFrameWriterOp(
+                self, name="inference_writer", stride=frame_write_stride,
+            )
 
         self.add_flow(self.eiger_zmq_rx, self.eiger_decompress, {("image_index_encoding", "image_index_encoding")})
         self.add_flow(self.eiger_decompress, self.image_batch, {("decompressed_image", "image"), ("image_index", "image_index")})
@@ -729,6 +868,8 @@ class PtychoApp(Application):
             # ViT: branch off ImagePreprocessorOp's diff_amp (fan-out, parallel to image_send)
             self.add_flow(self.image_proc, self.vit, {("diff_amp", "diff_amp"), ("image_indices", "image_indices")})
             self.add_flow(self.vit, self.vit_save, {("vit_result", "results")})
+            # Persist model output per kept dp row — sibling of FrameWriterOp.
+            self.add_flow(self.vit, self.inference_writer, {("vit_result", "results")})
             # Async tiled mosaic write: capacity=1 + QueuePolicy.POP on the
             # writer's input drops superseded snapshots while a write is in
             # flight, so the ViT branch keeps stitching at full cadence.
