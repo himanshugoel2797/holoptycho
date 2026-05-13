@@ -107,6 +107,47 @@ ssh -L 8000:localhost:8000 <user>@<host>
 
 ---
 
+## Development container
+
+On hosts with a glibc too old to run the pixi env directly (e.g. older RHEL), use a minimal CUDA+pixi container as a runtime shell. Edit, commit, and push from the host as normal; only run code inside the container.
+
+### 1. Build the dev image (one-time)
+
+```bash
+docker build -t cuda-dev - <<'EOF'
+FROM nvidia/cuda:12.8.1-runtime-ubuntu22.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libgl1 curl ca-certificates && \
+    rm -rf /var/lib/apt/lists/* && \
+    curl -fsSL https://pixi.sh/install.sh | PIXI_HOME=/usr/local bash
+EOF
+```
+
+### 2. Drop into a dev shell (run from the repo root)
+
+```bash
+docker run --rm -it --gpus all --shm-size=32g --network host \
+  --user "$(id -u):$(id -g)" -v "$PWD":/app -e HOME=/app -w /app \
+  cuda-dev bash
+```
+
+`--network host` puts the container in the host's network namespace so the holoscan app can reach host services (ZMQ streams, Tiled, etc.) and bind to ports the host can see. The repo (including `.pixi/`) is mounted at `/app`, so changes made inside the container show up on the host immediately.
+
+### 3. Build / update the pixi env inside the container
+
+Always run `pixi install` **inside** the dev container, not on the host — that way the env's binaries are linked against the container's glibc, which is what they'll run against in production too. From within the dev shell:
+
+```bash
+pixi install                  # solve / sync .pixi/ from pixi.lock
+pixi shell                    # activate the env in this shell
+# ...or run the API directly:
+pixi run api
+```
+
+If you previously ran `pixi install` on the host, delete `.pixi/` and re-install inside the container the first time so nothing is stale.
+
+---
+
 ## Controlling the pipeline
 
 Use the `hp` CLI to start, stop, and configure the pipeline. It connects to `http://localhost:8000` by default — override with `--url` or `HOLOPTYCHO_URL`.
