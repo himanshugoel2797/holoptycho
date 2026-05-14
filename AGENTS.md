@@ -539,7 +539,7 @@ tiled login --profile nsls2
 pixi install -e replay
 
 # If holoptycho has no selected engine yet, choose one before using --hp-start
-hp model set nsls0408_bs1
+hp model set run042901
 hp model status
 ```
 

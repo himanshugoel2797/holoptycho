@@ -329,7 +329,7 @@ print(uid)                                         # ← UUID4 for --uid
 PY
 
 # 2. If holoptycho has no selected engine yet, choose one before --hp-start
-hp model set nsls0408_bs1
+hp model set run042901
 hp model status
 
 # 3. Run the replay (canonical form: --hp-start lets the script build the
