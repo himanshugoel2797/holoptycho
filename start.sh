@@ -116,11 +116,11 @@ run_args=(
 if [[ $USE_API_KEY -eq 1 ]]; then
   run_args+=(-e TILED_API_KEY)
 else
-  # Mount the host's tiled cached tokens. Container HOME defaults to /root,
-  # so this is where tiled-client looks for the per-server cached token
-  # written by `tiled login`. Tiled writes are attributed to the
-  # authenticated user.
-  run_args+=(-v "$HOME/.config/tiled:/root/.config/tiled")
+  # Mount the host's tiled token cache. tiled-client stores access/refresh
+  # tokens under ~/.cache/tiled/tokens/<url-encoded-base>/ — the container's
+  # HOME defaults to /root, so this is where it looks. Tiled writes are
+  # attributed to the authenticated user.
+  run_args+=(-v "$HOME/.cache/tiled:/root/.cache/tiled")
 fi
 
 if [[ $DETACH -eq 0 ]]; then
