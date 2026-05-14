@@ -12,6 +12,13 @@ A Docker image is built and pushed to Azure Container Registry on every merge to
 
 One-time setup on the compute node:
 - `az login`, with permissions to read `genesisdemoskv` and pull from `genesisdemosacr`.
+- For personal Tiled writes (the default), cache a token on the host:
+  ```bash
+  pixi install -e client                                                  # no private deps
+  pixi run -e client tiled profile create https://tiled.nsls2.bnl.gov --name nsls2
+  pixi run -e client tiled login --profile nsls2
+  ```
+  Skip these if you'll always run with `--api-key`.
 - On slurm / non-systemd hosts, configure `~/.config/containers/storage.conf` for a shared graphroot (template at the top of [`scripts/slurm_start_holoptycho.sh`](scripts/slurm_start_holoptycho.sh)).
 
 On slurm clusters, first allocate a GPU node:
@@ -23,11 +30,12 @@ salloc --gres=gpu:1 --mem=64G --cpus-per-gpu=2 --account=staff
 Then start the container:
 
 ```bash
-./start.sh           # foreground — logs stream to the terminal
-./start.sh -d        # detached — script prints the logs/stop commands and exits
+./start.sh                  # foreground, personal Tiled auth (default)
+./start.sh -d               # detached — script prints the logs/stop commands and exits
+./start.sh --api-key        # shared TILED_API_KEY from Key Vault instead of personal token
 ```
 
-[`start.sh`](start.sh) does the ACR podman login (the cluster runs rootless podman, so we use `az acr login --expose-token` to pass a token directly to `podman login`), pulls secrets fresh from Key Vault, and starts the container with all the runtime env vars wired in. The API binds to `127.0.0.1:8000` on the host only — see [Connect via SSH tunnel](#connect-via-ssh-tunnel) for remote access.
+[`start.sh`](start.sh) does the ACR podman login (the cluster runs rootless podman, so we use `az acr login --expose-token` to pass a token directly to `podman login`), fetches the Azure service-principal secrets fresh from Key Vault, and starts the container with all the runtime env vars wired in. Tiled writes go through your personal `tiled login` token by default (mounted in from `~/.config/tiled`); pass `--api-key` to use the shared service-account key instead — appropriate for unattended/production runs. The API binds to `127.0.0.1:8000` on the host only — see [Connect via SSH tunnel](#connect-via-ssh-tunnel) for remote access.
 
 ### Connect via SSH tunnel
 
@@ -50,8 +58,9 @@ On hosts with a glibc too old to run the pixi env directly (e.g. older RHEL), us
 The first run builds a small `cuda-dev` image (nvidia/cuda runtime + pixi) — about a minute. Subsequent runs reuse it. Inside the shell:
 
 ```bash
-pixi install                                          # first time / after pixi.lock changes
-pixi run tiled login https://tiled.nsls2.bnl.gov      # once per dev shell
+pixi install                                                              # first time / after pixi.lock changes
+pixi run tiled profile create https://tiled.nsls2.bnl.gov --name nsls2    # once per dev shell
+pixi run tiled login --profile nsls2
 export ENGINE_CACHE_DIR=/tmp/models
 pixi run api
 ```

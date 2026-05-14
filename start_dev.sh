@@ -6,7 +6,8 @@
 # Edit, commit, and push from the host as normal — only code execution
 # happens inside the container. Inside the shell:
 #     pixi install                                          # first time
-#     pixi run tiled login https://tiled.nsls2.bnl.gov      # once per shell
+#     pixi run tiled profile create https://tiled.nsls2.bnl.gov --name nsls2  # once
+#     pixi run tiled login --profile nsls2                   # once per shell
 #     export ENGINE_CACHE_DIR=/tmp/models
 #     pixi run api
 #
