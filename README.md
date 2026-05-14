@@ -8,33 +8,33 @@ For batch/offline reconstruction of completed scans, use [`NSLS2/ptycho`](https:
 
 ## Container deployment
 
-A Docker image is built and pushed to Azure Container Registry on every merge to main. See [`.github/workflows/build-container.yml`](.github/workflows/build-container.yml).
+The image is built and pushed to ACR on every merge to main ([`.github/workflows/build-container.yml`](.github/workflows/build-container.yml)).
 
-On slurm clusters, first allocate a GPU node:
+1. Allocate a GPU node on slurm:
+   ```bash
+   salloc --gres=gpu:1 --mem=64G --cpus-per-gpu=2 --account=staff
+   ```
 
-```bash
-salloc --gres=gpu:1 --mem=64G --cpus-per-gpu=2 --account=staff
-```
+2. Log in to Azure (needs read on `genesisdemoskv` and pull on `genesisdemosacr`):
+   ```bash
+   az login
+   ```
 
-One-time setup on the allocated node:
-- `az login`, with permissions to read `genesisdemoskv` and pull from `genesisdemosacr`.
-- For personal Tiled writes (the default), cache a token on the host:
-  ```bash
-  pixi install -e client                                                  # no private deps
-  pixi run -e client tiled profile create https://tiled.nsls2.bnl.gov --name nsls2
-  pixi run -e client tiled login --profile nsls2
-  ```
-  Skip these if you'll always run with `--api-key`.
+3. Cache a personal Tiled token (skip if you'll only use `--api-key`):
+   ```bash
+   pixi install -e client
+   pixi run -e client tiled profile create https://tiled.nsls2.bnl.gov --name nsls2
+   pixi run -e client tiled login --profile nsls2
+   ```
 
-Start the container:
+4. Start the container:
+   ```bash
+   ./start.sh              # personal Tiled auth, foreground
+   ./start.sh -d           # detached
+   ./start.sh --api-key    # shared TILED_API_KEY from Key Vault
+   ```
 
-```bash
-./start.sh                  # foreground, personal Tiled auth (default)
-./start.sh -d               # detached — script prints the logs/stop commands and exits
-./start.sh --api-key        # shared TILED_API_KEY from Key Vault instead of personal token
-```
-
-[`start.sh`](start.sh) does the ACR podman login (the cluster runs rootless podman, so we use `az acr login --expose-token` to pass a token directly to `podman login`), fetches the Azure service-principal secrets fresh from Key Vault, and starts the container with all the runtime env vars wired in. Tiled writes go through your personal `tiled login` token by default (mounted in from `~/.config/tiled`); pass `--api-key` to use the shared service-account key instead — appropriate for unattended/production runs. The API binds to `127.0.0.1:8000` on the host only — see [Connect via SSH tunnel](#connect-via-ssh-tunnel) for remote access.
+The API binds to `127.0.0.1:8000` on the node — see [Connect via SSH tunnel](#connect-via-ssh-tunnel) for remote access. See [`start.sh`](start.sh) for what each step does inside the script.
 
 ### Connect via SSH tunnel
 
