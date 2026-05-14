@@ -10,6 +10,8 @@ For batch/offline reconstruction of completed scans, use [`NSLS2/ptycho`](https:
 
 The image is built and pushed to ACR on every merge to main ([`.github/workflows/build-container.yml`](.github/workflows/build-container.yml)).
 
+Run all of the following from the root of a `holoptycho` clone (the `pixi` commands and `./start.sh` are relative to it).
+
 1. Allocate a GPU node on slurm:
    ```bash
    salloc --gres=gpu:1 --mem=64G --cpus-per-gpu=2 --account=staff
