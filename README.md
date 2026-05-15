@@ -326,12 +326,12 @@ pixi run -e replay replay \
     --hp-start \
     --nx 256 --ny 256 \
     --rate 1000 --chunk-size 1024 --skip-frames 64 \
-    --recon-mode vit --no-compress
+    --recon-mode vit
 
 # Variant: skip --hp-start when holoptycho is already running with a config
 # that exactly matches the scan being replayed. Most of the time, prefer the
 # command above.
-pixi run -e replay replay --scan-id 404611 --rate 1000 --no-compress
+pixi run -e replay replay --scan-id 404611 --rate 1000
 # (then in another terminal, if needed)
 hp start '{"scan_num": "404611", ...}'
 ```
@@ -384,15 +384,13 @@ the config the replay script POSTs to holoptycho):
   than loading the whole scan up front, so replay starts publishing within
   seconds even for multi-GB scans. Smaller chunks = lower startup latency
   and lower peak memory; larger = fewer round-trips.
-- **`--no-compress`** — skip bslz4 compression and publish raw frame bytes
-  with a `"raw"` encoding header. The receiver inside holoptycho recognises
-  this and reshapes the bytes directly without invoking the dectris
-  decompressor. Avoids the ~30s/batch Python `bitshuffle` bottleneck that
-  otherwise gates publish throughput (`dectris-compression 0.3.1` removed
-  the C `compress` entrypoint, so the script falls back to a pure-Python
-  implementation). Localhost ZMQ handles the ~10× larger wire size easily,
-  so a 50s scan replays in 50s instead of ~12 min. Live mode is unaffected
-  — the real Eiger detector never uses the `"raw"` encoding.
+- **`--compress`** — opt in to bslz4 compression and publish frames in the
+  same wire format the live Eiger uses. **Off by default**, because
+  `dectris-compression 0.3.1` removed the C `compress` entrypoint and the
+  pure-Python `bitshuffle` fallback gates publish throughput at ~15 fps. The
+  default raw-bytes path uses a `"raw"` encoding header that holoptycho's
+  receiver recognises; localhost ZMQ handles the ~10× larger wire size
+  easily. Enable only when explicitly testing the decompression code path.
 
 ### Best practices
 
@@ -416,11 +414,11 @@ the config the replay script POSTs to holoptycho):
 - **`--max-frames N` plus `--n-iterations 50–100`** gets you a full
   end-to-end cycle (config → stream → recon → final write) in under a
   minute for quick smoke tests on big scans.
-- **Pass `--no-compress`** for replay throughput. With the current
-  `dectris-compression` package the C `compress` is missing, so the
-  default path falls back to Python `bitshuffle` which gates the
-  pipeline at ~15 frames/sec. `--no-compress` removes that bottleneck
-  entirely.
+- **Leave compression off** (the default). With the current
+  `dectris-compression` package the C `compress` is missing, so enabling
+  `--compress` falls back to Python `bitshuffle` and gates the pipeline at
+  ~15 frames/sec. Enable only when you specifically need to test the
+  decompression path.
 
 ---
 

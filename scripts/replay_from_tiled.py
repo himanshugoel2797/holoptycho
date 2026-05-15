@@ -768,13 +768,15 @@ def parse_args():
              "interval (chunk_size / rate_hz) the stream stays smooth.",
     )
     parser.add_argument(
-        "--no-compress",
+        "--compress",
         action="store_true",
-        help="Skip bslz4 compression and publish raw frame bytes with a "
-             "'raw' encoding header. Avoids the ~30s/batch Python "
-             "bitshuffle bottleneck (dectris-compression 0.3.1 dropped "
-             "the C compress entrypoint, so the script falls back to a "
-             "pure-Python implementation otherwise). The receiver inside "
+        help="Bslz4-compress the published Eiger frames (matching the live "
+             "wire format). Off by default because dectris-compression 0.3.1 "
+             "dropped its C compress entrypoint and the pure-Python "
+             "bitshuffle fallback is ~30s/batch — basically unusable. Enable "
+             "only when explicitly verifying the decompression code path. "
+             "Without this flag the script publishes raw bytes with a "
+             "'raw' encoding header instead. The receiver inside "
              "holoptycho recognises 'raw' and reshapes the bytes directly.",
     )
     return parser.parse_args()
@@ -876,7 +878,7 @@ def main():
             args.eiger_server_secret_key,
             args.eiger_client_public_key,
             args.rate,
-            args.no_compress,
+            not args.compress,
         ),
         name="eiger-publisher",
     )

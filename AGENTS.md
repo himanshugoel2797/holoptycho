@@ -562,7 +562,7 @@ pixi run -e replay replay \
     --hp-start \
     --nx 256 --ny 256 \
     --rate 1000 --chunk-size 1024 --skip-frames 64 \
-    --recon-mode vit --no-compress
+    --recon-mode vit
 ```
 
 Tune for your scan:
@@ -576,12 +576,7 @@ Tune for your scan:
 Use this only when holoptycho is already running with a config that exactly matches the scan being replayed (same `nx`/`ny`/geometry). Most of the time you want `--hp-start`.
 
 ```bash
-pixi run -e replay replay \
-    --uid 7fcf8d25-f609-4f2c-8710-44793341455f \
-    --tiled-url https://tiled.nsls2.bnl.gov/hxn/migration \
-    --eiger-endpoint tcp://0.0.0.0:5555 \
-    --panda-endpoint tcp://0.0.0.0:5556 \
-    --rate 1000 --no-compress
+pixi run -e replay replay --scan-id 404611 --rate 1000
 ```
 
 By default the replay script publishes plain ZMQ. To test CurveZMQ, also
@@ -721,17 +716,18 @@ from `PtychoViTInferenceOp`, the chunking loop is misbehaving — check that
   is the fastest path for verifying changes to `mosaic_stitch.py` /
   `SaveViTResult`.
 
-* **Default to `--no-compress`.** `dectris-compression 0.3.1` removed the
-  C `compress` entrypoint, so without this flag the replay script falls
-  back to a Python `bitshuffle.compress_lz4` per frame which gates publish
-  throughput at ~15 frames/sec — a 50-second scan takes ~12 minutes to
-  replay and the pipeline can fall behind by tens of batches. `--no-compress`
-  publishes raw frame bytes with a `"raw"` encoding header; the receiver
-  in `holoptycho/datasource.py::decode_json_message` recognises this and
+* **Leave compression off** (now the default). `dectris-compression 0.3.1`
+  removed the C `compress` entrypoint, so passing `--compress` falls back
+  to Python `bitshuffle.compress_lz4` per frame, gating publish throughput
+  at ~15 frames/sec — a 50-second scan takes ~12 minutes to replay and the
+  pipeline can fall behind by tens of batches. The default raw-bytes path
+  publishes frames with a `"raw"` encoding header; the receiver in
+  `holoptycho/datasource.py::decode_json_message` recognises this and
   reshapes the bytes directly, skipping decompression. Localhost ZMQ
   handles the ~10× larger wire size easily, so replay runs at the
   requested `--rate`. Live mode is unaffected — the real Eiger detector
-  never sets `encoding=raw`.
+  never sets `encoding=raw`. Enable `--compress` only when explicitly
+  verifying the decompression code path.
 
 Then start holoptycho with:
 
