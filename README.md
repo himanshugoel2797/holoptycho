@@ -305,42 +305,25 @@ sbatch scripts/slurm_start_holoptycho.sh
 
 To test holoptycho end-to-end without a live beamline, use `scripts/replay_from_tiled.py`. It reads a real scan from Tiled and publishes it over ZMQ on the same node as holoptycho, in the exact Eiger and PandA wire formats. Both the replay script and holoptycho must run on the **same machine** — ZMQ traffic stays local.
 
-> **`--uid` expects a Bluesky UUID4, not a scan number.** Passing the
-> scan number directly fails — the Tiled catalog is keyed by UUID.
-> Look up the UID from the scan id first (step 1b below).
-
 ### On the compute node
 
 ```bash
-# 1a. Authenticate with Tiled and install the replay env (once)
+# 1. Authenticate with Tiled and install the replay env (once)
 tiled profile create https://tiled.nsls2.bnl.gov --name nsls2
 tiled login --profile nsls2
 pixi install -e replay
-
-# 1b. Look up the run UID from a scan id
-pixi run -e replay python - <<'PY'
-from tiled.client import from_uri
-from tiled.queries import Eq
-
-catalog = from_uri("https://tiled.nsls2.bnl.gov")["hxn"]["raw"]
-results = catalog.search(Eq("scan_id", 404611))   # ← scan id
-uid = next(iter(results))
-print(uid)                                         # ← UUID4 for --uid
-PY
 
 # 2. If holoptycho has no selected engine yet, choose one before --hp-start
 hp model set run042901
 hp model status
 
-# 3. Run the replay (canonical form: --hp-start lets the script build the
-#    correct config from the same run and start/restart holoptycho before
-#    publishing). Replace --uid with the UUID from step 1b.
+# 3. Run the replay. Use --scan-id to look up the run automatically (newest
+#    run with that scan_id wins — scan_id is not unique), or pass --uid
+#    directly if you already have a UUID. The --tiled-url, --hp-url, and
+#    --eiger/panda-endpoint flags all default to the HXN-typical values.
 pixi run -e replay replay \
-    --uid 7fcf8d25-f609-4f2c-8710-44793341455f \
-    --tiled-url https://tiled.nsls2.bnl.gov/hxn/migration \
-    --hp-start --hp-url http://localhost:8000 \
-    --eiger-endpoint tcp://0.0.0.0:5555 \
-    --panda-endpoint tcp://0.0.0.0:5556 \
+    --scan-id 404611 \
+    --hp-start \
     --nx 256 --ny 256 \
     --rate 1000 --chunk-size 1024 --skip-frames 64 \
     --recon-mode vit --no-compress
@@ -348,12 +331,7 @@ pixi run -e replay replay \
 # Variant: skip --hp-start when holoptycho is already running with a config
 # that exactly matches the scan being replayed. Most of the time, prefer the
 # command above.
-pixi run -e replay replay \
-    --uid 7fcf8d25-f609-4f2c-8710-44793341455f \
-    --tiled-url https://tiled.nsls2.bnl.gov/hxn/migration \
-    --eiger-endpoint tcp://0.0.0.0:5555 \
-    --panda-endpoint tcp://0.0.0.0:5556 \
-    --rate 1000 --no-compress
+pixi run -e replay replay --scan-id 404611 --rate 1000 --no-compress
 # (then in another terminal, if needed)
 hp start '{"scan_num": "404611", ...}'
 ```

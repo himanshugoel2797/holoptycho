@@ -54,6 +54,7 @@ from config_from_tiled import (
     get_stream,
     load_config_from_tiled,
     lookup_run,
+    lookup_uid_by_scan_id,
     open_tiled_node,
 )
 
@@ -664,13 +665,19 @@ def parse_args():
     parser.add_argument(
         "--uid",
         default=os.environ.get("TILED_RUN_UID"),
-        required=not os.environ.get("TILED_RUN_UID"),
-        help="Run UID to replay (or set TILED_RUN_UID env var)",
+        help="Run UID to replay (or set TILED_RUN_UID env var; alternatively, pass --scan-id)",
+    )
+    parser.add_argument(
+        "--scan-id",
+        type=int,
+        default=None,
+        help="Bluesky scan_id (integer). Resolved to a UID via tiled search of hxn/raw; "
+             "if multiple runs share the scan_id the newest by start.time is used.",
     )
     parser.add_argument(
         "--tiled-url",
-        default=os.environ.get("TILED_BASE_URL", ""),
-        help="Tiled catalog URL containing run entries, e.g. https://tiled.nsls2.bnl.gov/hxn/migration",
+        default=os.environ.get("TILED_BASE_URL", "https://tiled.nsls2.bnl.gov/hxn/migration"),
+        help="Tiled catalog URL containing run entries (default: HXN migration catalog)",
     )
     parser.add_argument(
         "--tiled-api-key",
@@ -811,6 +818,19 @@ def main():
 
     if not args.tiled_url:
         print("ERROR: --tiled-url or TILED_BASE_URL is required", file=sys.stderr)
+        sys.exit(1)
+
+    if args.scan_id is not None and args.uid:
+        print("ERROR: pass either --uid or --scan-id, not both", file=sys.stderr)
+        sys.exit(1)
+    if args.scan_id is not None:
+        args.uid = lookup_uid_by_scan_id(args.tiled_url, args.scan_id)
+        print(f"[replay] scan_id={args.scan_id} → uid={args.uid}", flush=True)
+    if not args.uid:
+        print(
+            "ERROR: must provide --uid, --scan-id, or set TILED_RUN_UID",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     # Open tiled handles + eagerly load only the head frames + encoder

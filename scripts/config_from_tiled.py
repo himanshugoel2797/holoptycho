@@ -200,6 +200,56 @@ def get_stream(run, stream_name: str):
     return node["data"] if "data" in list(node) else node
 
 
+def lookup_uid_by_scan_id(tiled_url: str, scan_id) -> str:
+    """Find the newest Bluesky run UID for a given ``scan_id``.
+
+    ``scan_id`` is *not* unique — the same scan_id can be assigned to several
+    runs (e.g. a scan retried after a failure). Returns the UID of the most
+    recent match, ranked by the ``start.time`` metadata. Searches against
+    ``hxn/raw`` (where scan_id is indexed); only the tiled server root is
+    derived from ``tiled_url``, not its catalog path.
+    """
+    from tiled.queries import Eq
+
+    parsed = urlsplit(tiled_url)
+    root_url = urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+    root = open_tiled_node(root_url)
+    try:
+        catalog = root["hxn"]["raw"]
+    except KeyError:
+        print(
+            f"ERROR: tiled server at {root_url} has no hxn/raw catalog",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        scan_id_int = int(scan_id)
+    except (TypeError, ValueError):
+        print(
+            f"ERROR: --scan-id must be an integer, got {scan_id!r}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    results = catalog.search(Eq("scan_id", scan_id_int))
+    uids = list(results)
+    if not uids:
+        print(
+            f"ERROR: no run in hxn/raw with scan_id={scan_id_int}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    def _start_time(uid):
+        try:
+            return results[uid].metadata.get("start", {}).get("time", 0.0)
+        except Exception:
+            return 0.0
+
+    return max(uids, key=_start_time)
+
+
 def lookup_run(client, run_uid: str, tiled_url: str):
     candidates = [client]
 

@@ -543,36 +543,23 @@ hp model set run042901
 hp model status
 ```
 
-#### 1. Look up the run UID from a scan id
-
-```bash
-pixi run -e replay python - <<'PY'
-from tiled.client import from_uri
-from tiled.queries import Eq
-
-catalog = from_uri("https://tiled.nsls2.bnl.gov")["hxn"]["raw"]
-results = catalog.search(Eq("scan_id", 404611))   # ← scan id
-uid = next(iter(results))
-print(uid)                                         # ← UUID4 to pass as --uid
-PY
-```
-
-#### 2. Canonical replay command (with `--hp-start`)
+#### 1. Canonical replay command (with `--hp-start`)
 
 `--hp-start` is the standard pattern: the replay script builds the run
 config from the same run metadata and `/run`s or `/restart`s holoptycho
 before it begins publishing, so the pipeline always sees the right
 `scan_num`, geometry, and pixel size.
 
+Use `--scan-id <int>` to look up the run automatically (newest match wins
+— scan_id is not unique), or pass `--uid <UUID4>` directly if you already
+have the UUID.
+
 ```bash
 # 256x256 detector ROI, ViT branch only, full HXN scan at 1 kHz publish rate.
-# Replace --uid with the UUID from step 1.
+# --tiled-url, --hp-url, and --eiger/panda-endpoint default to HXN-typical values.
 pixi run -e replay replay \
-    --uid 7fcf8d25-f609-4f2c-8710-44793341455f \
-    --tiled-url https://tiled.nsls2.bnl.gov/hxn/migration \
-    --hp-start --hp-url http://localhost:8000 \
-    --eiger-endpoint tcp://0.0.0.0:5555 \
-    --panda-endpoint tcp://0.0.0.0:5556 \
+    --scan-id 404611 \
+    --hp-start \
     --nx 256 --ny 256 \
     --rate 1000 --chunk-size 1024 --skip-frames 64 \
     --recon-mode vit --no-compress
