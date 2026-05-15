@@ -181,7 +181,7 @@ Override reconstruction parameters as needed:
 hp start "$(pixi run -e client config-from-tiled --scan-num 320045 --nx 256 --ny 256 --n-iterations 1000)"
 
 # Run only the iterative solver or only the ViT branch (default is both):
-hp start "$(pixi run -e client config-from-tiled --scan-num 320045 --recon-mode iterative)"
+hp start "$(pixi run -e client config-from-tiled --scan-num 320045 --mode iterative)"
 ```
 
 ### Model selection
@@ -321,19 +321,7 @@ hp model status
 #    run with that scan_id wins — scan_id is not unique), or pass --uid
 #    directly if you already have a UUID. The --tiled-url, --hp-url, and
 #    --eiger/panda-endpoint flags all default to the HXN-typical values.
-pixi run -e replay replay \
-    --scan-id 404611 \
-    --hp-start \
-    --nx 256 --ny 256 \
-    --chunk-size 1024 --skip-frames 64 \
-    --recon-mode vit
-
-# Variant: skip --hp-start when holoptycho is already running with a config
-# that exactly matches the scan being replayed. Most of the time, prefer the
-# command above.
-pixi run -e replay replay --scan-id 404611
-# (then in another terminal, if needed)
-hp start '{"scan_num": "404611", ...}'
+pixi run -e replay replay --scan-id 404611 --mode vit
 ```
 
 By default the replay script publishes plain ZMQ. To test CurveZMQ, also
@@ -358,7 +346,7 @@ inside the container refers to the container itself, not the Slurm node host.
 These flags only take effect when `--hp-start` is used (they're written into
 the config the replay script POSTs to holoptycho):
 
-- **`--recon-mode {iterative,vit,both}`** — which reconstruction branches the
+- **`--mode {iterative,vit,both}`** — which reconstruction branches the
   pipeline wires up. `iterative` runs only the DM/ML solver, `vit` runs only
   the ViT inference network, and `both` (default) runs them in parallel.
   Useful for isolating GPU-contention issues on single-GPU nodes or for
@@ -394,11 +382,14 @@ the config the replay script POSTs to holoptycho):
 
 ### Best practices
 
-- **Pass `--nx` and `--ny` together.** `--hp-start` builds a fresh config
-  from `config-from-tiled`, which defaults `nx`/`ny` to 128. Most HXN
-  detector frames are 256×256, so a 128×anything ROI causes
-  `ValueError: could not broadcast input array from shape (256,128) into shape (128,256)`
-  at pipeline startup. For 256-pixel scans always pass `--nx 256 --ny 256`.
+- **`--nx` / `--ny` must match the selected engine's input dimensions.**
+  These set the detector-frame crop size fed into the pipeline; the
+  default of 256×256 matches the current HXN engines
+  (`ptycho_vit_amp_phase_b64`, `run042901`). A mismatch with the engine
+  input raises `ValueError: could not broadcast input array from shape
+  (256,128) into shape (128,256)` at pipeline startup. The detector frame
+  can be larger — the pipeline crops down — but it must be at least
+  `nx × ny`.
 - **Run only one replay at a time.** Concurrent `--hp-start` replays
   mid-stream the pipeline: the second run's `/restart` interrupts the first
   while it's publishing, leaving PandA and Eiger out of sync. Positions
@@ -409,7 +400,7 @@ the config the replay script POSTs to holoptycho):
   the commanded scan range by several × and crash the iterative recon's
   pre-allocated object grid. The ViT branch tolerates them but stitches
   them into the wrong canvas region. Drop those rows.
-- **Default to `--recon-mode vit`** when iterating on ViT/mosaic code —
+- **Default to `--mode vit`** when iterating on ViT/mosaic code —
   fastest cycle and the iterative branch can't crash the run.
 - **`--max-frames N` plus `--n-iterations 50–100`** gets you a full
   end-to-end cycle (config → stream → recon → final write) in under a

@@ -435,7 +435,7 @@ hp start "$(pixi run -e client config-from-tiled --scan-num 320045)"
 hp start "$(pixi run -e client config-from-tiled --scan-num 320045 --nx 256 --n-iterations 1000)"
 
 # 2b. (Optional) Pick which reconstruction branches to run
-hp start "$(pixi run -e client config-from-tiled --scan-num 320045 --recon-mode iterative)"  # or vit | both (default)
+hp start "$(pixi run -e client config-from-tiled --scan-num 320045 --mode iterative)"  # or vit | both (default)
 
 # 3. (Optional) Switch to a different model
 hp model set my_vit_model --version 3
@@ -538,46 +538,34 @@ tiled profile create https://tiled.nsls2.bnl.gov --name nsls2  # once
 tiled login --profile nsls2
 pixi install -e replay
 
-# If holoptycho has no selected engine yet, choose one before using --hp-start
+# If holoptycho has no selected engine yet, choose one before replaying
 hp model set run042901
 hp model status
 ```
 
-#### 1. Canonical replay command (with `--hp-start`)
+#### 1. Canonical replay command
 
-`--hp-start` is the standard pattern: the replay script builds the run
-config from the same run metadata and `/run`s or `/restart`s holoptycho
-before it begins publishing, so the pipeline always sees the right
-`scan_num`, geometry, and pixel size.
+By default the replay script `/run`s or `/restart`s holoptycho with a config
+built from the same run metadata before publishing, so the pipeline always
+sees the right `scan_num`, geometry, and pixel size. Pass `--no-hp-start`
+to skip that step when holoptycho is already running with a matching config.
 
 Use `--scan-id <int>` to look up the run automatically (newest match wins
 — scan_id is not unique), or pass `--uid <UUID4>` directly if you already
 have the UUID.
 
 ```bash
-# 256x256 detector ROI, ViT branch only, full HXN scan at 1 kHz publish rate.
-# --tiled-url, --hp-url, and --eiger/panda-endpoint default to HXN-typical values.
-pixi run -e replay replay \
-    --scan-id 404611 \
-    --hp-start \
-    --nx 256 --ny 256 \
-    --chunk-size 1024 --skip-frames 64 \
-    --recon-mode vit
+# ViT branch only, full HXN scan.
+# --tiled-url, --hp-url, --eiger/panda-endpoint, and --nx/--ny default to
+# HXN-typical values (256×256 crop, the current engine input size).
+pixi run -e replay replay --scan-id 404611 --mode vit
 ```
 
 Tune for your scan:
-* `--nx` / `--ny`: must match the detector ROI (256 for HXN scans, 128 for many older scans). See "Best practices for replay" below — these *must* be passed together.
+* `--nx` / `--ny`: must match the selected engine's input dimensions (default 256, matching current HXN engines). See "Best practices for replay" below — they *must* be passed together if you override.
 * `--rate`: informational only — the publisher dumps each chunk as fast as ZMQ drains and ignores this value. Set it for the startup banner if you want; it doesn't gate timing.
 * `--skip-frames`: drops the first N Eiger frames + matching encoder samples. Required for scans with settling/ramp-up rows.
-* `--recon-mode`: `vit` is the fastest path when iterating on `mosaic_stitch.py` / `SaveViTResult`; `iterative` exercises only DM/ML; `both` runs both branches in parallel.
-
-#### Variant: replay without restarting holoptycho
-
-Use this only when holoptycho is already running with a config that exactly matches the scan being replayed (same `nx`/`ny`/geometry). Most of the time you want `--hp-start`.
-
-```bash
-pixi run -e replay replay --scan-id 404611
-```
+* `--mode`: `vit` is the fastest path when iterating on `mosaic_stitch.py` / `SaveViTResult`; `iterative` exercises only DM/ML; `both` runs both branches in parallel.
 
 By default the replay script publishes plain ZMQ. To test CurveZMQ, also
 pass the full Eiger key set: `--eiger-server-public-key`,
@@ -628,13 +616,14 @@ from `PtychoViTInferenceOp`, the chunking loop is misbehaving — check that
 
 ### Best practices for replay
 
-* **Pass `--nx` and `--ny` together.** `--hp-start` builds a fresh config from
-  `config-from-tiled`, which defaults `nx`/`ny` to 128. Detector frames for most
-  HXN scans are 256×256, so a 128×anything ROI causes
+* **`--nx`/`--ny` must match the selected engine's input dimensions.**
+  These set the detector-frame crop size fed into the pipeline; the default
+  256×256 matches current HXN engines (`ptycho_vit_amp_phase_b64`,
+  `run042901`). A mismatch raises
   `ValueError: could not broadcast input array from shape (256,128) into shape (128,256)`
-  in `preprocess.py::ImagePreprocessorOp.compute` at startup. For 256-pixel
-  scans always pass `--nx 256 --ny 256` (or whatever matches the actual
-  detector ROI).
+  in `preprocess.py::ImagePreprocessorOp.compute` at startup. The detector
+  frame can be larger — the pipeline crops down — but it must be at least
+  `nx × ny`. If you override, pass both together.
 
 * **Run only one replay at a time.** Concurrent `--hp-start` replays mid-stream
   the pipeline: the second run's `/restart` interrupts the first while it's
@@ -709,7 +698,7 @@ from `PtychoViTInferenceOp`, the chunking loop is misbehaving — check that
   frames. Combine with `--n-iterations 50–100` to get a full end-to-end
   cycle (config write → stream → recon → final write) in under a minute.
 
-* **`--recon-mode {iterative,vit,both}` for branch-isolation.** Use
+* **`--mode {iterative,vit,both}` for branch-isolation.** Use
   `iterative` to test the DM/ML solver without TRT competition, `vit` to
   test the ViT branch (and the server-side mosaic stitching) without
   iterative, or `both` to run them in parallel for comparison. `vit`-only

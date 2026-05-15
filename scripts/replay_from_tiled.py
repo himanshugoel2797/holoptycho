@@ -17,9 +17,9 @@ Usage
         --panda-endpoint tcp://0.0.0.0:5556 \\
         --rate 200
 
-    To have the replay script configure and start holoptycho before publishing,
-    add --hp-start. It will build the run config from the same run metadata
-    and POST it to the holoptycho API before replay begins.
+    By default the replay script configures and starts holoptycho via its API
+    using config built from the same run metadata. Pass --no-hp-start when
+    holoptycho is already running with a config that matches the scan.
 
 SSH tunnel (run on your local machine to expose the ZMQ ports):
     ssh -L 5555:localhost:5555 -L 5556:localhost:5556 <slurm-login-node>
@@ -686,8 +686,11 @@ def parse_args():
     )
     parser.add_argument(
         "--hp-start",
-        action="store_true",
-        help="Start or restart holoptycho via its API using config from the same run before replaying",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Start or restart holoptycho via its API using config from the same run before replaying. "
+             "Default: on. Pass --no-hp-start when holoptycho is already running with a config "
+             "that exactly matches the scan being replayed.",
     )
     parser.add_argument(
         "--hp-url",
@@ -762,8 +765,8 @@ def parse_args():
     parser.add_argument(
         "--chunk-size",
         type=int,
-        default=256,
-        help="Number of frames per tiled fetch during streaming (default: 256). "
+        default=1024,
+        help="Number of frames per tiled fetch during streaming (default: 1024). "
              "Smaller = lower latency before publishing starts and lower peak "
              "memory; larger = fewer round-trips. The publisher fetches the "
              "next chunk between rate-limited frame sends, so as long as a "

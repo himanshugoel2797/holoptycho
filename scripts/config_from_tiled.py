@@ -494,8 +494,12 @@ def add_reconstruction_arguments(parser: argparse.ArgumentParser):
         "These are not in the scan metadata and must be set explicitly.",
     )
     recon.add_argument("--working-directory", default="/ptycho_gui_holoscan")
-    recon.add_argument("--nx", type=int, default=128)
-    recon.add_argument("--ny", type=int, default=128)
+    recon.add_argument("--nx", type=int, default=256,
+                       help="Detector-frame crop width; must match the selected engine's input "
+                            "width (default: 256, matching current HXN engines).")
+    recon.add_argument("--ny", type=int, default=256,
+                       help="Detector-frame crop height; must match the selected engine's input "
+                            "height (default: 256, matching current HXN engines).")
     # batch-width/height default to nx/ny (substituted in build_full_config
     # when None) — they're almost always equal to the recon frame size.
     recon.add_argument("--batch-width", type=int, default=None,
@@ -521,7 +525,7 @@ def add_reconstruction_arguments(parser: argparse.ArgumentParser):
     recon.add_argument("--sign", default="t1")
     recon.add_argument("--display-interval", type=int, default=10)
     recon.add_argument(
-        "--recon-mode",
+        "--mode",
         choices=["iterative", "vit", "both"],
         default="both",
         help=(
@@ -592,7 +596,7 @@ def build_full_config(run_uid: str, tiled_url: str, args: argparse.Namespace) ->
         "nth": "5",
         "sign": args.sign,
         "display_interval": str(args.display_interval),
-        "recon_mode": args.recon_mode,
+        "recon_mode": args.mode,
     })
 
     return config
