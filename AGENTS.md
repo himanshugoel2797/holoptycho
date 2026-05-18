@@ -146,6 +146,30 @@ podman login genesisdemosacr.azurecr.io \
 
 ### 4. Start the container
 
+Use `start.sh` rather than a raw `docker run` — it handles ACR login, secret
+fetching, and ZMQ source selection in one step:
+
+```bash
+# Live beamline (Eiger + PandA on xf03idc-eiger2-ioc.nsls2.bnl.local)
+./start.sh --live
+
+# Replay / testing (listens on localhost:5555/5556 for replay_from_tiled.py)
+./start.sh
+
+# Run detached and use shared Tiled API key from Key Vault
+./start.sh --live -d --api-key
+```
+
+`--live` fetches the Eiger CurveZMQ server public key from Key Vault secret
+`holoptycho-eiger-server-public-key` and sets:
+- `SERVER_STREAM_SOURCE=tcp://xf03idc-eiger2-ioc.nsls2.bnl.local:5559`
+- `PANDA_STREAM_SOURCE=tcp://xf03idc-eiger2-ioc.nsls2.bnl.local:6666`
+
+Without `--live` those are set to `tcp://host.docker.internal:5555/5556` for
+the replay script.
+
+If you need to run the container manually (e.g. with extra debug flags):
+
 ```bash
 docker run --pull=always --gpus all -p 127.0.0.1:8000:8000 --shm-size=32g \
   -e AZURE_TENANT_ID="$(az account show --query tenantId -o tsv)" \
@@ -157,9 +181,9 @@ docker run --pull=always --gpus all -p 127.0.0.1:8000:8000 --shm-size=32g \
   -e TILED_BASE_URL="https://tiled.nsls2.bnl.gov" \
   -e TILED_API_KEY="$(az keyvault secret show --vault-name genesisdemoskv --name holoptycho-tiled-api-key --query value -o tsv)" \
   -e HOLOPTYCHO_LOG_LEVEL="DEBUG" \
-  -e SERVER_STREAM_SOURCE="tcp://<eiger-host>:5555" \
-  -e PANDA_STREAM_SOURCE="tcp://<panda-host>:5556" \
-  -e SERVER_PUBLIC_KEY="<eiger-server-public-key>" \
+  -e SERVER_STREAM_SOURCE="tcp://xf03idc-eiger2-ioc.nsls2.bnl.local:5559" \
+  -e PANDA_STREAM_SOURCE="tcp://xf03idc-eiger2-ioc.nsls2.bnl.local:6666" \
+  -e SERVER_PUBLIC_KEY="$(az keyvault secret show --vault-name genesisdemoskv --name holoptycho-eiger-server-public-key --query value -o tsv)" \
   -e CLIENT_PUBLIC_KEY="<client-public-key>" \
   -e CLIENT_SECRET_KEY="<client-secret-key>" \
   genesisdemosacr.azurecr.io/holoptycho:latest
@@ -460,9 +484,9 @@ hp restart "$(pixi run -e client config-from-tiled --scan-num 320046)"
 | `HOLOPTYCHO_DB_PATH` | `holoptycho.db` | SQLite DB path (server-side) |
 | `HOLOPTYCHO_CONFIG_DIR` | `configs/` | Directory for generated INI files (server-side) |
 | `ENGINE_CACHE_DIR` | `/models` | Directory for cached `.engine` files (server-side). Outside the container this default is not writable — point it at a user-writable path before starting the server (e.g. `$HOME/.cache/holoptycho/models`). |
-| `SERVER_STREAM_SOURCE` | — | **Required.** ZMQ endpoint of the Eiger detector |
-| `PANDA_STREAM_SOURCE` | — | **Required.** ZMQ endpoint of the PandA box |
-| `SERVER_PUBLIC_KEY` | — | CurveZMQ server (Eiger) public key |
+| `SERVER_STREAM_SOURCE` | — | **Required.** ZMQ endpoint of the Eiger detector. Live beamline: `tcp://xf03idc-eiger2-ioc.nsls2.bnl.local:5559`. For replay use `tcp://host.docker.internal:5555`. Set automatically by `start.sh --live`. |
+| `PANDA_STREAM_SOURCE` | — | **Required.** ZMQ endpoint of the PandA box. Live beamline: `tcp://xf03idc-eiger2-ioc.nsls2.bnl.local:6666`. For replay use `tcp://host.docker.internal:5556`. Set automatically by `start.sh --live`. |
+| `SERVER_PUBLIC_KEY` | — | CurveZMQ server (Eiger) public key. Fetched from Key Vault secret `holoptycho-eiger-server-public-key` by `start.sh --live`. |
 | `CLIENT_PUBLIC_KEY` | — | CurveZMQ client public key |
 | `CLIENT_SECRET_KEY` | — | CurveZMQ client secret key |
 | `TILED_BASE_URL` | — | **Required.** Tiled server URL |
@@ -493,9 +517,9 @@ docker run --pull=always --gpus all -p 127.0.0.1:8000:8000 --shm-size=32g \
   -e AZURE_ML_WORKSPACE=genesis-mlw \
   -e TILED_BASE_URL="https://tiled.nsls2.bnl.gov" \
   -e TILED_API_KEY="$(az keyvault secret show --vault-name genesisdemoskv --name holoptycho-tiled-api-key --query value -o tsv)" \
-  -e SERVER_STREAM_SOURCE="tcp://<eiger-host>:5555" \
-  -e PANDA_STREAM_SOURCE="tcp://<panda-host>:5556" \
-  -e SERVER_PUBLIC_KEY="<eiger-server-public-key>" \
+  -e SERVER_STREAM_SOURCE="tcp://xf03idc-eiger2-ioc.nsls2.bnl.local:5559" \
+  -e PANDA_STREAM_SOURCE="tcp://xf03idc-eiger2-ioc.nsls2.bnl.local:6666" \
+  -e SERVER_PUBLIC_KEY="$(az keyvault secret show --vault-name genesisdemoskv --name holoptycho-eiger-server-public-key --query value -o tsv)" \
   -e CLIENT_PUBLIC_KEY="<client-public-key>" \
   -e CLIENT_SECRET_KEY="<client-secret-key>" \
   <image> <command>

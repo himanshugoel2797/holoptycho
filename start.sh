@@ -25,18 +25,25 @@ set -euo pipefail
 
 DETACH=0
 USE_API_KEY=0
+LIVE=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -d|--detach) DETACH=1 ;;
     --api-key) USE_API_KEY=1 ;;
+    --live) LIVE=1 ;;
     -h|--help)
       cat <<'USAGE'
-Usage: ./start.sh [-d|--detach] [--api-key]
+Usage: ./start.sh [-d|--detach] [--api-key] [--live]
 
   -d, --detach   Run the container detached. The script prints the
                  logs/stop commands and exits.
   --api-key      Use the shared TILED_API_KEY from Key Vault instead of
                  your personal cached token from `tiled login`.
+  --live         Connect to the live beamline ZMQ streams (Eiger + PandA
+                 on xf03idc-eiger2-ioc.nsls2.bnl.local). Fetches the
+                 Eiger CurveZMQ server public key from Key Vault.
+                 Without this flag the container listens on localhost
+                 ports 5555/5556 for the replay script.
 USAGE
       exit 0
       ;;
@@ -87,6 +94,19 @@ if [[ $USE_API_KEY -eq 1 ]]; then
   export TILED_API_KEY
 fi
 
+# --- ZMQ stream sources ----------------------------------------------------
+BEAMLINE_HOST="xf03idc-eiger2-ioc.nsls2.bnl.local"
+if [[ $LIVE -eq 1 ]]; then
+  SERVER_STREAM_SOURCE="tcp://${BEAMLINE_HOST}:5559"
+  PANDA_STREAM_SOURCE="tcp://${BEAMLINE_HOST}:6666"
+  SERVER_PUBLIC_KEY="$(az keyvault secret show --vault-name "$KEYVAULT" --name holoptycho-eiger-server-public-key --query value -o tsv)"
+  export SERVER_PUBLIC_KEY
+else
+  SERVER_STREAM_SOURCE="tcp://host.docker.internal:5555"
+  PANDA_STREAM_SOURCE="tcp://host.docker.internal:5556"
+fi
+export SERVER_STREAM_SOURCE PANDA_STREAM_SOURCE
+
 # --- Run the container -----------------------------------------------------
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 
@@ -109,9 +129,13 @@ run_args=(
   -e AZURE_RESOURCE_GROUP="$RESOURCE_GROUP"
   -e AZURE_ML_WORKSPACE="$ML_WORKSPACE"
   -e TILED_BASE_URL="$TILED_BASE_URL"
-  -e SERVER_STREAM_SOURCE="tcp://host.docker.internal:5555"
-  -e PANDA_STREAM_SOURCE="tcp://host.docker.internal:5556"
+  -e SERVER_STREAM_SOURCE
+  -e PANDA_STREAM_SOURCE
 )
+
+if [[ $LIVE -eq 1 ]]; then
+  run_args+=(-e SERVER_PUBLIC_KEY)
+fi
 
 if [[ $USE_API_KEY -eq 1 ]]; then
   run_args+=(-e TILED_API_KEY)
