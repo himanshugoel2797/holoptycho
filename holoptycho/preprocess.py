@@ -240,6 +240,18 @@ class ImagePreprocessorOp(Operator):
             dy, dx = self._center_shift
             processed_images = self._apply_shift(processed_images, dy, dx)
 
+        # Anti-diagonal flip per frame: HXN eiger data lands in the pipeline
+        # reflected across the anti-diagonal relative to the beamline
+        # operator's view. Applying the flip here means both the saved dp
+        # tap (next line) and the model-input branch downstream operate on
+        # data in the operator orientation, which is what the ViT model was
+        # trained on. Force a contiguous copy — the chain afterwards
+        # (rot90/fftshift/transpose/sqrt) is much slower on a strided view,
+        # which we saw back up ImagePreprocessorOp and starve point_proc.
+        processed_images = np.ascontiguousarray(
+            processed_images.transpose(0, 2, 1)[:, ::-1, ::-1]
+        )
+
         # Tap detector-frame intensity before rot90/fftshift — ptycho-vit's
         # training loader expects intensity in detector orientation. Contiguous
         # copy so downstream rot90 (returns a view) doesn't alias the emitted

@@ -259,7 +259,7 @@ class SaveViTResult(Operator):
         phase_channel_index: int = 1,
         overshoot_factor: float = 1.2,
         enable_batch_writes: bool = False,
-        transpose_patches: bool = True,
+        antidiag_flip_patches: bool = False,
         **kwargs,
     ):
         # Holoscan's Operator.__init__ calls setup(spec), so any attribute
@@ -269,12 +269,12 @@ class SaveViTResult(Operator):
         super().__init__(fragment, *args, **kwargs)
         self.batch_num = 0
         self.max_index_seen = -1
-        # Transpose each predicted patch before stitching. Required for HXN
-        # data: the object-domain array axes are swapped relative to the
-        # probe/dp frame, so patches stitched without this transpose come
-        # out rotated 90° relative to the scan grid (matches Fix #9 in the
-        # offline run_inference.py).
-        self._transpose_patches = transpose_patches
+        # Anti-diagonal flip per predicted patch before stitching. Required
+        # for HXN data: the object-domain array axes are reflected across the
+        # anti-diagonal relative to the probe/dp frame, so patches stitched
+        # without this correction come out mirrored relative to the scan grid.
+        # Equivalent to ``transpose(0, 2, 1)[:, ::-1, ::-1]``.
+        self._antidiag_flip_patches = antidiag_flip_patches
         # Optional callable returning the latest (n, 2) per-frame positions
         # array (microns) — typically lambda: point_proc.positions_um. When
         # supplied, the snapshot is published alongside each ViT batch so
@@ -430,8 +430,8 @@ class SaveViTResult(Operator):
 
         def _extract_channel(ch_idx: int) -> np.ndarray:
             patches = pred[:, ch_idx].astype(np.float32, copy=False)
-            if self._transpose_patches:
-                patches = patches.transpose(0, 2, 1)
+            if self._antidiag_flip_patches:
+                patches = patches.transpose(0, 2, 1)[:, ::-1, ::-1]
             if self._inner_crop > 0:
                 c = self._inner_crop
                 patches = patches[:, c:-c, c:-c]
