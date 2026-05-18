@@ -16,14 +16,14 @@ cd holoptycho
 pixi install -e client
 ```
 
-Add a shell alias so you can type `hp` from anywhere:
+Add a shell alias so you can type `hp` from anywhere. Run this from inside the repo:
 
 ```bash
 # bash
-echo 'alias hp="pixi run --manifest-path ~/code/holoptycho/pixi.toml -e client hp"' >> ~/.bashrc && source ~/.bashrc
+echo "alias hp=\"pixi run --manifest-path $PWD/pixi.toml -e client hp\"" >> ~/.bashrc && source ~/.bashrc
 
 # zsh
-echo 'alias hp="pixi run --manifest-path ~/code/holoptycho/pixi.toml -e client hp"' >> ~/.zshrc && source ~/.zshrc
+echo "alias hp=\"pixi run --manifest-path $PWD/pixi.toml -e client hp\"" >> ~/.zshrc && source ~/.zshrc
 ```
 
 ### 2. Point hp at the server

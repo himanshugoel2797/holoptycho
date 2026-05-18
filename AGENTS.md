@@ -87,10 +87,10 @@ echo 'alias hp="pixi run -e client hp"' >> ~/.zshrc
 source ~/.zshrc
 ```
 
-The alias assumes the user runs `hp` from the `holoptycho` repo directory, since pixi needs the `pixi.toml` to resolve the environment. If they want to run it from anywhere, use an absolute path:
+The alias assumes the user runs `hp` from the `holoptycho` repo directory, since pixi needs the `pixi.toml` to resolve the environment. If they want to run it from anywhere, use `$PWD` while inside the repo so the path is captured correctly:
 
 ```bash
-echo 'alias hp="pixi run --manifest-path ~/code/holoptycho/pixi.toml -e client hp"' >> ~/.zshrc
+echo "alias hp=\"pixi run --manifest-path $PWD/pixi.toml -e client hp\"" >> ~/.zshrc
 ```
 
 ### 5. Updating the CLI
