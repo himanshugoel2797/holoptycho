@@ -290,8 +290,11 @@ are reachable and the CurveZMQ key is accepted. It uses the `replay` pixi env
 ```bash
 pixi install -e replay  # once
 
-# Run the check — passes SERVER_PUBLIC_KEY inline so it never touches disk
-SERVER_PUBLIC_KEY="$(az keyvault secret show --vault-name genesisdemoskv --name holoptycho-eiger-server-public-key --query value -o tsv)" pixi run -e replay python scripts/check_zmq.py
+# Run the check with all three keys (recommended — tests the exact keys the container will use)
+SERVER_PUBLIC_KEY="$(az keyvault secret show --vault-name genesisdemoskv --name holoptycho-eiger-server-public-key --query value -o tsv)" \
+CLIENT_PUBLIC_KEY="$(az keyvault secret show --vault-name genesisdemoskv --name holoptycho-client-public-key --query value -o tsv)" \
+CLIENT_SECRET_KEY="$(az keyvault secret show --vault-name genesisdemoskv --name holoptycho-client-secret-key --query value -o tsv)" \
+pixi run -e replay python scripts/check_zmq.py
 
 # Longer timeout during an active scan to confirm data flows
 SERVER_PUBLIC_KEY="..." pixi run -e replay python scripts/check_zmq.py --timeout 30
@@ -302,8 +305,13 @@ Outcomes per stream:
 | Result | Meaning |
 |---|---|
 | `OK` | Connected and received data — detector armed / scan running |
-| `TIMEOUT` | Connected fine, no data — no scan running (expected when idle) |
-| `ERROR` | Failed to connect — wrong key, host unreachable, or port closed |
+| `TIMEOUT` | TCP reachable, no data — no scan running (expected when idle) or CurveZMQ handshake failed |
+| `ERROR` | TCP connection failed — host unreachable or port closed |
+
+The script now does a TCP pre-check before attempting ZMQ. `ERROR` means the
+port is not reachable at all (firewall or wrong host). `TIMEOUT` with a scan
+running likely means a CurveZMQ key mismatch — the handshake fails silently
+and the SUB socket receives nothing.
 
 `TIMEOUT` with no scan running is the expected result when confirming a new
 deployment. `ERROR` means something is actually wrong.
@@ -312,6 +320,90 @@ deployment. `ERROR` means something is actually wrong.
 generates a throwaway keypair automatically when only `SERVER_PUBLIC_KEY` is
 set. The production pipeline (`EigerZmqRxOp` in `datasource.py`) requires all
 three keys and will raise `RuntimeError` if only some are set.
+
+### CurveZMQ key format
+
+Keys must be **Z85-encoded 40-character ASCII strings** as produced by
+`zmq.curve_keypair()`. If a key stored in Key Vault contains non-ASCII
+characters, it was stored in the wrong format and will cause
+`UnicodeEncodeError: 'ascii' codec can't encode characters` in `datasource.py`.
+
+To generate a valid keypair and store it:
+
+```bash
+pixi run -e client python3 -c '
+import zmq
+pub, sec = zmq.curve_keypair()
+print("PUBLIC:", pub.decode("ascii"))
+print("SECRET:", sec.decode("ascii"))
+'
+az keyvault secret set --vault-name genesisdemoskv --name holoptycho-client-public-key --value "<pub>"
+az keyvault secret set --vault-name genesisdemoskv --name holoptycho-client-secret-key --value "<sec>"
+```
+
+Note: use **single quotes** around the Python snippet in bash — double quotes
+cause the shell to interpret the inner quotes and produce a `SyntaxError`.
+
+The Eiger server does not allowlist client keys — it uses them only for
+encryption — so regenerated client keys work without any beamline-side changes.
+
+**After storing new keys in KV, the container must be restarted** — keys are
+fetched from KV at `start.sh` time and baked into the container environment.
+`hp restart` alone is not enough; you must run `./start.sh --live` again (and
+then `hp model set` + `hp start` since the engine cache is lost on restart).
+
+### Diagnosing CurveZMQ TIMEOUT
+
+If `check_zmq.py` returns `TIMEOUT` with a scan running (TCP reachable, PandA
+OK), use the ephemeral keypair to narrow down which key is wrong:
+
+```bash
+# Step 1: try with only SERVER_PUBLIC_KEY (ephemeral client pair)
+SERVER_PUBLIC_KEY="$(az keyvault secret show --vault-name genesisdemoskv --name holoptycho-eiger-server-public-key --query value -o tsv)" \
+pixi run -e replay python scripts/check_zmq.py --timeout 30
+```
+
+| Step 1 result | Meaning | Fix |
+|---|---|---|
+| `OK` | SERVER_PUBLIC_KEY correct, client keys wrong | Regenerate client keypair (see above) |
+| `TIMEOUT` | SERVER_PUBLIC_KEY wrong | Contact beamline team for current Eiger server key |
+
+### Eiger nftables firewall
+
+The Eiger IOC machine (`xf03idc-eiger2-ioc.nsls2.bnl.local`) runs nftables
+with a `policy drop` chain (`inet firewall inbound`). Connections from compute
+nodes outside the beamline subnet (e.g. mars5 at `10.65.3.205`) are blocked by
+default.
+
+To allow a machine to connect to the ZMQ ports, add a rule **before** the
+catch-all drop rules. The correct approach:
+
+```bash
+# 1. Find the handle of the first catch-all drop (look for "Connection Denied")
+nft -a list chain inet firewall inbound | grep "Connection Denied"
+
+# 2. Find the handle of the existing allowed-source rules (e.g. 10.65.15.35)
+#    and insert at the same position
+nft -a list chain inet firewall inbound | grep "10.65.15.35"
+
+# 3. Insert BEFORE those rules (use the handle of the first existing accept rule
+#    for ports 5559/6666 as the position anchor)
+nft insert rule inet firewall inbound position <handle> ip saddr <mars5-ip> tcp dport { 5559, 6666 } accept
+```
+
+**Important:** `nft add rule` appends to the end of the chain — after the
+catch-all drop — so the rule is never evaluated. Always use
+`nft insert rule ... position <handle>` to place it before the drop rules.
+`nft insert rule position N` inserts **before** handle N.
+
+Verify the rule landed in the right place:
+```bash
+nft -a list chain inet firewall inbound | grep -A2 -B2 "<mars5-ip>"
+```
+
+The accepted source IPs for ports 5559/6666 as of 2026-05-18:
+- `10.65.15.35` — pre-existing (unknown machine)
+- `10.65.3.205` — mars5
 
 ---
 
@@ -547,8 +639,8 @@ hp restart "$(pixi run -e client config-from-tiled --scan-id 320046)"
 | `SERVER_STREAM_SOURCE` | — | **Required.** ZMQ endpoint of the Eiger detector. Live beamline: `tcp://xf03idc-eiger2-ioc.nsls2.bnl.local:5559`. For replay use `tcp://host.docker.internal:5555`. Set automatically by `start.sh --live`. |
 | `PANDA_STREAM_SOURCE` | — | **Required.** ZMQ endpoint of the PandA box. Live beamline: `tcp://xf03idc-eiger2-ioc.nsls2.bnl.local:6666`. For replay use `tcp://host.docker.internal:5556`. Set automatically by `start.sh --live`. |
 | `SERVER_PUBLIC_KEY` | — | CurveZMQ server (Eiger) public key. Fetched from Key Vault secret `holoptycho-eiger-server-public-key` by `start.sh --live`. |
-| `CLIENT_PUBLIC_KEY` | — | CurveZMQ client public key |
-| `CLIENT_SECRET_KEY` | — | CurveZMQ client secret key |
+| `CLIENT_PUBLIC_KEY` | — | CurveZMQ client public key. Fetched from Key Vault secret `holoptycho-client-public-key` by `start.sh --live`. |
+| `CLIENT_SECRET_KEY` | — | CurveZMQ client secret key. Fetched from Key Vault secret `holoptycho-client-secret-key` by `start.sh --live`. |
 | `TILED_BASE_URL` | — | **Required.** Tiled server URL |
 | `TILED_API_KEY` | — | Tiled API key (optional — falls back to cached `tiled login` token; store in Key Vault as `holoptycho-tiled-api-key` for production) |
 | `TILED_CATALOG_PATH` | `hxn/processed/holoptycho` | Tiled catalog path for output |

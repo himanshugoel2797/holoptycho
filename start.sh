@@ -106,7 +106,9 @@ if [[ $LIVE -eq 1 ]]; then
   SERVER_STREAM_SOURCE="tcp://${BEAMLINE_HOST}:5559"
   PANDA_STREAM_SOURCE="tcp://${BEAMLINE_HOST}:6666"
   SERVER_PUBLIC_KEY="$(az keyvault secret show --vault-name "$KEYVAULT" --name holoptycho-eiger-server-public-key --query value -o tsv)"
-  export SERVER_PUBLIC_KEY
+  CLIENT_PUBLIC_KEY="$(az keyvault secret show --vault-name "$KEYVAULT" --name holoptycho-client-public-key --query value -o tsv)"
+  CLIENT_SECRET_KEY="$(az keyvault secret show --vault-name "$KEYVAULT" --name holoptycho-client-secret-key --query value -o tsv)"
+  export SERVER_PUBLIC_KEY CLIENT_PUBLIC_KEY CLIENT_SECRET_KEY
 else
   SERVER_STREAM_SOURCE="tcp://host.docker.internal:5555"
   PANDA_STREAM_SOURCE="tcp://host.docker.internal:5556"
@@ -142,7 +144,7 @@ run_args=(
 )
 
 if [[ $LIVE -eq 1 ]]; then
-  run_args+=(-e SERVER_PUBLIC_KEY)
+  run_args+=(-e SERVER_PUBLIC_KEY -e CLIENT_PUBLIC_KEY -e CLIENT_SECRET_KEY)
 fi
 
 if [[ $USE_API_KEY -eq 1 ]]; then

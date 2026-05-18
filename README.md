@@ -16,25 +16,37 @@ cd holoptycho
 pixi install -e client
 ```
 
-Add a shell alias so you can type `hp` from anywhere. Run this from inside the repo:
+Add a shell alias so you can type `hp` from anywhere. Set `HOLOPTYCHO_REPO` to wherever you cloned the repo:
 
 ```bash
 # bash
-echo "alias hp=\"pixi run --manifest-path $PWD/pixi.toml -e client hp\"" >> ~/.bashrc && source ~/.bashrc
+echo 'alias hp="pixi run --manifest-path /path/to/holoptycho/pixi.toml -e client hp"' >> ~/.bashrc && source ~/.bashrc
 
 # zsh
-echo "alias hp=\"pixi run --manifest-path $PWD/pixi.toml -e client hp\"" >> ~/.zshrc && source ~/.zshrc
+echo 'alias hp="pixi run --manifest-path /path/to/holoptycho/pixi.toml -e client hp"' >> ~/.zshrc && source ~/.zshrc
 ```
 
-### 2. Point hp at the server
+### 2. Open an SSH tunnel to mars5
 
-The holoptycho server runs on `mars5`. Set it as your default remote once:
+The API port is firewalled. The tunnel must be opened as your **personal NSLS-II account** (not the beamline account) since compute nodes require key-based SSH auth. Once the tunnel is open, any account on the machine can use it.
+
+Add an alias to your personal shell config:
 
 ```bash
-hp remote set mars5
+# bash (~/.bashrc)
+echo 'alias proxy_mars="ssh -L 8000:localhost:8000 -N mars5.nsls2.bnl.gov"' >> ~/.bashrc && source ~/.bashrc
+
+# zsh (~/.zshrc)
+echo 'alias proxy_mars="ssh -L 8000:localhost:8000 -N mars5.nsls2.bnl.gov"' >> ~/.zshrc && source ~/.zshrc
 ```
 
-### 3. Start a reconstruction
+SSH will use your current username by default. Run `proxy_mars` in a terminal and keep it open — `hp` commands from any account on the machine will reach the server through the tunnel.
+
+### 3. Point hp at the server
+
+The tunnel forwards `localhost:8000` to mars5, so the default remote works as-is — no configuration needed.
+
+### 4. Start a reconstruction
 
 ```bash
 hp start "$(pixi run -e client config-from-tiled --scan-id <scan_id>)"

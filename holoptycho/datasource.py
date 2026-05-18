@@ -1,3 +1,4 @@
+import base64
 import logging
 import socket
 import zmq
@@ -17,18 +18,68 @@ import os
 import copy
 from dectris.compression import decompress
 
-from holoscan.core import Application, Operator, OperatorSpec, Tracker, ConditionType, IOSpec
-from holoscan.decorator import create_op
-from holoscan.schedulers import GreedyScheduler, MultiThreadScheduler, EventBasedScheduler
 
+def _parse_zmq_key(value: str, name: str) -> bytes:
+    """Parse a CurveZMQ key string into bytes suitable for zmq.setsockopt.
+
+    Accepts:
+      - Z85-encoded 40-character ASCII strings (the native ZMQ format)
+      - Base64-encoded 44-character strings that decode to 32 raw key bytes
+
+    Raises ValueError with a clear message if the value is neither.
+    """
+    # Z85: 40 printable ASCII chars
+    try:
+        encoded = value.encode("ascii")
+        if len(encoded) == 40:
+            return encoded
+        # Wrong length for Z85 — fall through to base64 attempt
+    except UnicodeEncodeError:
+        pass  # Not ASCII at all — try base64
+
+    # Base64: 44 chars → 32 raw bytes
+    try:
+        raw = base64.b64decode(value)
+        if len(raw) == 32:
+            # Re-encode as Z85 so ZMQ accepts it as a string key
+            return zmq.z85.encode(raw)
+        raise ValueError(f"{name}: base64 decoded to {len(raw)} bytes, expected 32")
+    except Exception as exc:
+        raise ValueError(
+            f"{name}: cannot parse as Z85 (40 ASCII chars) or base64 "
+            f"(44 chars → 32 bytes). Got {len(value)}-char string. Original error: {exc}"
+        ) from exc
+
+
+from holoscan.core import (
+    Application,
+    Operator,
+    OperatorSpec,
+    Tracker,
+    ConditionType,
+    IOSpec,
+)
+from holoscan.decorator import create_op
+from holoscan.schedulers import (
+    GreedyScheduler,
+    MultiThreadScheduler,
+    EventBasedScheduler,
+)
 
 
 def std_err_print(msg):
-    sys.stderr.write(msg+"\n")
+    sys.stderr.write(msg + "\n")
 
 
-supported_encodings = {"bs32-lz4<": "bslz4", "lz4<": "lz4", "bs16-lz4<": "bslz4", "raw": "raw"}
+supported_encodings = {
+    "bs32-lz4<": "bslz4",
+    "lz4<": "lz4",
+    "bs16-lz4<": "bslz4",
+    "raw": "raw",
+}
 supported_types = {"uint32": "uint32", "uint16": "uint16"}
+
+
 def decode_json_message(data_msg, encoding_msg) -> tuple[str, npt.NDArray]:
     # std_err_print("DECODING THE MESSAGE")
     # There should be more robust way to detect this frame
@@ -67,6 +118,7 @@ tag_decoders = {
     70: "<u4",
 }
 
+
 def decode_cbor_message(zmq_message) -> tuple[str, npt.NDArray]:
     msg = cbor2.loads(zmq_message)
     if msg["type"] == "image":
@@ -84,7 +136,9 @@ def decode_cbor_message(zmq_message) -> tuple[str, npt.NDArray]:
             image = np.frombuffer(contents.value, dtype=dtype).reshape(shape)
         else:
             compression_type, elem_size, image = contents.value.value
-            decompressed_bytes = decompress(image, compression_type, elem_size=elem_size)
+            decompressed_bytes = decompress(
+                image, compression_type, elem_size=elem_size
+            )
             image = np.frombuffer(decompressed_bytes, dtype=dtype).reshape(shape)
     else:
         msg_type = ""
@@ -98,9 +152,7 @@ def parse_args():
         "--config",
         type=str,
         default="none",
-        help=(
-            "Holoscan config file"
-        ),
+        help=("Holoscan config file"),
     )
     args = parser.parse_args()
     config = args.config
@@ -108,10 +160,19 @@ def parse_args():
         config = "holoscan_config.yaml"
     return config
 
+
 class EigerZmqRxOp(Operator):
-    def __init__(self, fragment, endpoint = "" , msg_format = "json", receive_timeout_ms = 100, *args,**kwargs):
-        super().__init__(fragment, *args,**kwargs)
-        
+    def __init__(
+        self,
+        fragment,
+        endpoint="",
+        msg_format="json",
+        receive_timeout_ms=100,
+        *args,
+        **kwargs,
+    ):
+        super().__init__(fragment, *args, **kwargs)
+
         self.endpoint = endpoint
         self.msg_format = msg_format
         # self.receive_times = []
@@ -141,9 +202,9 @@ class EigerZmqRxOp(Operator):
             )
 
         if len(configured) == len(auth_values):
-            self.socket.setsockopt(zmq.CURVE_PUBLICKEY, client_pub.encode('ascii'))
-            self.socket.setsockopt(zmq.CURVE_SECRETKEY, client_sec.encode('ascii'))
-            self.socket.setsockopt(zmq.CURVE_SERVERKEY, server_pub.encode('ascii'))
+            self.socket.setsockopt(zmq.CURVE_PUBLICKEY, client_pub.encode("ascii"))
+            self.socket.setsockopt(zmq.CURVE_SECRETKEY, client_sec.encode("ascii"))
+            self.socket.setsockopt(zmq.CURVE_SERVERKEY, server_pub.encode("ascii"))
 
         # Set receive timeout
         self.socket.setsockopt(zmq.RCVTIMEO, receive_timeout_ms)
@@ -161,7 +222,7 @@ class EigerZmqRxOp(Operator):
             self.socket.connect(self.endpoint)
         except socket.error:
             self.logger.error("Failed to create socket")
-        
+
         super().__init__(fragment, *args, **kwargs)
         self.logger = logging.getLogger("EigerZmqRxOp")
         logging.basicConfig(level=logging.INFO)
@@ -184,7 +245,7 @@ class EigerZmqRxOp(Operator):
         # spec.output("image").condition(ConditionType.NONE)
         # spec.output("image_index").condition(ConditionType.NONE)
         spec.output("image_index_encoding").condition(ConditionType.NONE)
-    
+
     def compute(self, op_input, op_output, context):
         # self.logger.info("Waiting for message")
         self._diag_calls += 1
@@ -192,7 +253,9 @@ class EigerZmqRxOp(Operator):
         if now - self._diag_window_start >= 1.0:
             self.logger.debug(
                 "EigerZmqRx 1s: calls=%d rx=%d zmq_again=%d",
-                self._diag_calls, self._diag_rx, self._diag_again,
+                self._diag_calls,
+                self._diag_rx,
+                self._diag_again,
             )
             self._diag_window_start = now
             self._diag_calls = 0
@@ -206,7 +269,7 @@ class EigerZmqRxOp(Operator):
             if self.msg_format == "json":
                 while True:
                     msg = self.socket.recv()
-                    try: # skip messages that are not json
+                    try:  # skip messages that are not json
                         msg = json.loads(msg.decode())
                     except:
                         continue
@@ -229,11 +292,15 @@ class EigerZmqRxOp(Operator):
                 msg_type = "image"
                 # _, image_data = decode_json_message(data_msg, encoding_msg)
                 # self.receive_times.append(time.time())
-                output = (copy.deepcopy(data_msg), copy.deepcopy(frame_id), copy.deepcopy(encoding_msg))
+                output = (
+                    copy.deepcopy(data_msg),
+                    copy.deepcopy(frame_id),
+                    copy.deepcopy(encoding_msg),
+                )
                 op_output.emit(output, "image_index_encoding")
 
                 # sys.stderr.write("Send frame to decoding\n")
-                
+
                 # if len(self.receive_times) == 2000:
                 #     _receive_times = np.array(self.receive_times)
                 #     times_between_frames = np.diff(_receive_times)
@@ -242,11 +309,8 @@ class EigerZmqRxOp(Operator):
                 #     std_err_print(f"std time between frames: {np.std(times_between_frames)}")
                 #     std_err_print(f"min time between frames: {np.min(times_between_frames)}")
                 #     std_err_print(f"max time between frames: {np.max(times_between_frames)}")
-                
-                
-                return
 
-                    
+                return
 
                 # std_err_print(f"time between image rx: {time.time() - self.receive_timeout_ms}")
                 # image_data = image_data[self.roi[0, 0]:self.roi[0, 1],
@@ -260,14 +324,14 @@ class EigerZmqRxOp(Operator):
                 op_output.emit(image_data, "image")
                 op_output.emit(frame_id, "image_index")
                 self.index += 1
-            else: # probably should have a better handling of start/end messages
+            else:  # probably should have a better handling of start/end messages
                 self.index = 0
 
             # except Exception as ex:
             #     result = "ERROR: Failed to process message: {ex}"
             #     std_err_print(f"{pprint.pformat(result)}")
             #     std_err_print(traceback.format_exc())
-                
+
         except zmq.error.Again:
             # ZMQ poll timeout — no frame this tick. Holoscan ops can't block in
             # compute(), so RCVTIMEO is set and Again fires every empty poll.
@@ -277,7 +341,7 @@ class EigerZmqRxOp(Operator):
 
     def __del__(self):
         """Cleanup socket on deletion"""
-        if hasattr(self, 'socket'):
+        if hasattr(self, "socket"):
             self.socket.close()
 
 
@@ -315,13 +379,16 @@ class EigerDecompressOp(Operator):
         if now - self._diag_window_start >= 1.0:
             self.logger.debug(
                 "EigerDecompressOp 1s: calls=%d total=%.1f ms",
-                self._diag_calls, self._diag_total_ms,
+                self._diag_calls,
+                self._diag_total_ms,
             )
             self._diag_window_start = now
             self._diag_calls = 0
             self._diag_total_ms = 0.0
 
-        compressed_image, image_index, encoding_msg = op_input.receive("image_index_encoding")
+        compressed_image, image_index, encoding_msg = op_input.receive(
+            "image_index_encoding"
+        )
         _, decompressed_image = decode_json_message(compressed_image, encoding_msg)
         # std_err_print(f'Decompress {image_index}')
         op_output.emit(decompressed_image, "decompressed_image")
@@ -330,13 +397,16 @@ class EigerDecompressOp(Operator):
 
 
 class PositionRxOp(Operator):
-    def __init__(self, *args,
-                endpoint:str=None,
-                receive_timeout_ms:int=100,
-                ch1:str=None,
-                ch2:str=None,
-                upsample_factor:int=None,
-                **kwargs):
+    def __init__(
+        self,
+        *args,
+        endpoint: str = None,
+        receive_timeout_ms: int = 100,
+        ch1: str = None,
+        ch2: str = None,
+        upsample_factor: int = None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.logger = logging.getLogger("PositionRxOp")
         logging.basicConfig(level=logging.INFO)
@@ -360,7 +430,7 @@ class PositionRxOp(Operator):
         self._msgs_received = 0
         self._last_progress_frame = -1
 
-    def flush(self,param):
+    def flush(self, param):
         self.data_x_str = param[0]
         self.data_y_str = param[1]
 
@@ -403,9 +473,9 @@ class PositionRxOp(Operator):
 
                 # final_size = size // self.upsample_factor
                 # idx_start = idx_start // self.upsample_factor
-                # index = np.arange(idx_start, idx_start + final_size)      
+                # index = np.arange(idx_start, idx_start + final_size)
                 # std_err_print(f"{index[:10]=}")
-                op_output.emit((frame_number,np.array([x, y])), "pointRx_out")
+                op_output.emit((frame_number, np.array([x, y])), "pointRx_out")
             elif msg["msg_type"] == "stop":
                 self.logger.info(
                     "PositionRxOp: stop msg received after %d data msgs, "
@@ -414,17 +484,20 @@ class PositionRxOp(Operator):
                     msg.get("emitted_frames"),
                 )
             elif msg["msg_type"] == "start":
-                self.logger.info("PositionRxOp: start msg received from %s", self.endpoint)
+                self.logger.info(
+                    "PositionRxOp: start msg received from %s", self.endpoint
+                )
         except zmq.error.Again:
             # ZMQ poll timeout — no message this tick. See note in EigerZmqRxOp.
             pass
         except Exception as e:
             self.logger.error(f"Error receiving message: {e}")
 
-                # for index, x, y in zip(index, x, y):
-                #     op_output.emit(np.array([x, y]), "point")
-                #     op_output.emit(index, "point_index")
-                    
+            # for index, x, y in zip(index, x, y):
+            #     op_output.emit(np.array([x, y]), "point")
+            #     op_output.emit(index, "point_index")
+
+
 # example of msg:
 # {'msg_type': 'start', 'arm_time': '2025-02-28T18:44:22.905865051Z', 'start_time': '2025-02-28T18:44:22.905908989Z', 'hw_time_offset_ns': None}
 # {'msg_type': 'data', 'frame_number': 0, 'datasets':
@@ -435,6 +508,6 @@ class PositionRxOp(Operator):
 # {'msg_type': 'stop', 'emitted_frames': 4}
 
 
-            # data = np.array([0, 0]) # placeholder - this should be changed to something that will actually receive the data
-        # op_output.emit(data, "point")
-        # op_output.emit(index, "point_index")
+# data = np.array([0, 0]) # placeholder - this should be changed to something that will actually receive the data
+# op_output.emit(data, "point")
+# op_output.emit(index, "point_index")

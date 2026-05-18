@@ -17,11 +17,83 @@ Usage:
 """
 
 import argparse
+import base64
 import json
 import os
+import socket
 import sys
 
 import zmq
+
+
+def _tcp_reachable(host: str, port: int, timeout: float = 3.0) -> bool:
+    """Return True if a TCP connection to host:port succeeds within timeout."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _parse_endpoint(endpoint: str) -> tuple[str, int]:
+    """Parse 'tcp://host:port' → (host, port)."""
+    # endpoint looks like tcp://hostname:5559
+    _, _, hostport = endpoint.partition("://")
+    host, _, port_str = hostport.rpartition(":")
+    return host, int(port_str)
+
+
+def _parse_zmq_key(value: str, name: str) -> bytes:
+    """Parse a CurveZMQ key string into bytes suitable for zmq.setsockopt.
+
+    Accepts:
+      - Z85-encoded 40-character ASCII strings (the native ZMQ format)
+      - Base64-encoded strings that decode to 32 raw key bytes
+      - Raw 32-byte binary strings (stored as latin-1)
+      - Raw 40-byte binary strings (stored as latin-1, passed directly to ZMQ)
+
+    Raises ValueError with a clear message if the value is none of the above.
+    """
+    # Z85: 40 printable ASCII chars
+    try:
+        encoded = value.encode("ascii")
+        if len(encoded) == 40:
+            return encoded
+    except UnicodeEncodeError:
+        pass  # Not ASCII — try other formats
+
+    # Base64: decode to 32 raw bytes, then re-encode as Z85
+    try:
+        ascii_val = value.encode("ascii")
+        raw = base64.b64decode(ascii_val)
+        if len(raw) == 32:
+            return zmq.z85.encode(raw)
+    except (UnicodeEncodeError, Exception):
+        pass
+
+    # Raw binary stored as a string (latin-1 preserves byte values 0-255)
+    try:
+        raw = value.encode("latin-1")
+        hex_preview = raw.hex()
+        if len(raw) == 32:
+            print(
+                f"  {name}: treating as raw 32-byte binary key (hex: {hex_preview[:16]}...)"
+            )
+            return raw
+        if len(raw) == 40:
+            print(
+                f"  {name}: treating as raw 40-byte binary key (hex: {hex_preview[:16]}...)"
+            )
+            return raw
+        raise ValueError(f"{name}: raw bytes length {len(raw)}, expected 32 or 40")
+    except Exception as exc:
+        pass
+
+    raise ValueError(
+        f"{name}: cannot parse key. Got {len(value)}-char string with non-ASCII chars. "
+        f"Expected Z85 (40 ASCII chars) or base64 (→ 32 bytes). "
+        f"Hex dump: {value.encode('latin-1', errors='replace').hex()}"
+    )
 
 
 def _apply_curve(sock: zmq.Socket) -> bool:
@@ -40,10 +112,12 @@ def _apply_curve(sock: zmq.Socket) -> bool:
         client_pub, client_sec = zmq.curve_keypair()
         print("  CurveZMQ: using ephemeral client keypair")
     else:
-        client_pub = client_pub.encode("ascii")
-        client_sec = client_sec.encode("ascii")
+        client_pub = _parse_zmq_key(client_pub, "CLIENT_PUBLIC_KEY")
+        client_sec = _parse_zmq_key(client_sec, "CLIENT_SECRET_KEY")
         print("  CurveZMQ: using provided client keypair")
-    sock.setsockopt(zmq.CURVE_SERVERKEY, server_key.encode("ascii"))
+    sock.setsockopt(
+        zmq.CURVE_SERVERKEY, _parse_zmq_key(server_key, "SERVER_PUBLIC_KEY")
+    )
     sock.setsockopt(zmq.CURVE_PUBLICKEY, client_pub)
     sock.setsockopt(zmq.CURVE_SECRETKEY, client_sec)
     return True
@@ -52,6 +126,13 @@ def _apply_curve(sock: zmq.Socket) -> bool:
 def check_eiger(ctx: zmq.Context, endpoint: str, timeout_ms: int) -> str:
     """Returns 'ok', 'timeout', or 'error'."""
     print(f"Eiger  {endpoint}")
+    host, port = _parse_endpoint(endpoint)
+    if not _tcp_reachable(host, port):
+        print(
+            f"  ERROR — TCP connection to {host}:{port} failed (host unreachable or port closed)"
+        )
+        return "error"
+    print(f"  TCP {host}:{port} reachable")
     sock = ctx.socket(zmq.SUB)
     sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
     sock.setsockopt(zmq.RCVHWM, 10)
@@ -99,6 +180,13 @@ def check_eiger(ctx: zmq.Context, endpoint: str, timeout_ms: int) -> str:
 def check_panda(ctx: zmq.Context, endpoint: str, timeout_ms: int) -> str:
     """Returns 'ok', 'timeout', or 'error'."""
     print(f"PandA  {endpoint}")
+    host, port = _parse_endpoint(endpoint)
+    if not _tcp_reachable(host, port):
+        print(
+            f"  ERROR — TCP connection to {host}:{port} failed (host unreachable or port closed)"
+        )
+        return "error"
+    print(f"  TCP {host}:{port} reachable")
     sock = ctx.socket(zmq.SUB)
     sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
     sock.setsockopt(zmq.RCVHWM, 10)
