@@ -6,45 +6,107 @@ For batch/offline reconstruction of completed scans, use [`NSLS2/ptycho`](https:
 
 ---
 
-## Container deployment
+## Quick start
 
-The image is built and pushed to ACR on every merge to main ([`.github/workflows/build-container.yml`](.github/workflows/build-container.yml)).
+### 1. Install the CLI
 
-Run all of the following from the root of a `holoptycho` clone (the `pixi` commands and `./start.sh` are relative to it).
+```bash
+git clone git@github.com:NSLS2/holoptycho.git
+cd holoptycho
+pixi install -e client
+```
 
-1. Allocate a GPU node on slurm:
+Add a shell alias so you can type `hp` from anywhere:
+
+```bash
+# bash
+echo 'alias hp="pixi run --manifest-path ~/code/holoptycho/pixi.toml -e client hp"' >> ~/.bashrc && source ~/.bashrc
+
+# zsh
+echo 'alias hp="pixi run --manifest-path ~/code/holoptycho/pixi.toml -e client hp"' >> ~/.zshrc && source ~/.zshrc
+```
+
+### 2. Point hp at the server
+
+The holoptycho server runs on `mars5`. Set it as your default remote once:
+
+```bash
+hp remote set mars5
+```
+
+### 3. Start a reconstruction
+
+```bash
+hp start "$(pixi run -e client config-from-tiled --scan-id <scan_id>)"
+```
+
+That's it. Use `hp status`, `hp logs`, and `hp stop` to monitor and control the pipeline.
+
+---
+
+## Server deployment
+
+The server runs on a Slurm GPU node (`mars5`). To (re)start it:
+
+1. Allocate a GPU node:
    ```bash
    salloc --gres=gpu:1 --mem=64G --cpus-per-gpu=2 --account=staff
    ```
 
-2. Log in to Azure (needs read on `genesisdemoskv` and pull on `genesisdemosacr`):
+2. Log in to Azure:
    ```bash
    az login
    ```
 
-3. Cache a personal Tiled token (skip if you'll only use `--api-key`):
+3. Cache a personal Tiled token (skip if using `--api-key`):
    ```bash
-   pixi install -e client
    pixi run -e client tiled profile create https://tiled.nsls2.bnl.gov --name nsls2
    pixi run -e client tiled login --profile nsls2
    ```
 
-4. Start the container — pick one:
+4. Start the container:
    ```bash
-   ./start.sh              # personal Tiled auth, foreground
-   ./start.sh -d           # detached
-   ./start.sh --api-key    # shared TILED_API_KEY from Key Vault
+   ./start.sh --live --expose -d           # live beamline, detached, network-accessible
+   ./start.sh --live --expose -d --api-key # same but with shared Tiled API key from Key Vault
+   ./start.sh                              # replay/testing mode (localhost ZMQ only)
    ```
 
-The API binds to `127.0.0.1:8000` on the node — see [Connect via SSH tunnel](#connect-via-ssh-tunnel) for remote access. See [`start.sh`](start.sh) for what each step does inside the script.
+   `--live` connects to the Eiger and PandA ZMQ streams on the beamline.
+   `--expose` binds the API to `0.0.0.0` so other machines on the network can reach it at `http://mars5.nsls2.bnl.gov:8000`.
 
-### Connect via SSH tunnel
+---
 
-The API binds to `127.0.0.1:8000` (localhost only). For remote access, open an SSH tunnel:
+## Verifying ZMQ connectivity
+
+Before starting a live run, use `scripts/check_zmq.py` to confirm both streams
+are reachable and the CurveZMQ key is accepted. The script connects to the
+Eiger and PandA endpoints, waits up to `--timeout` seconds for any message,
+and reports one of three outcomes per stream:
+
+| Result | Meaning |
+|---|---|
+| `OK` | Connected and received data — detector is armed / scan is running |
+| `TIMEOUT` | Connected fine but no data — no scan is running (expected when idle) |
+| `ERROR` | Could not connect — wrong key, host unreachable, or port closed |
+
+A `TIMEOUT` with no scan running is the expected result and confirms the
+connection is healthy.
 
 ```bash
-ssh -L 8000:localhost:8000 <user>@<host>
+# Fetch the Eiger server key and run the check (uses the replay env — no GPU needed)
+pixi install -e replay   # once
+
+SERVER_PUBLIC_KEY="$(az keyvault secret show --vault-name genesisdemoskv --name holoptycho-eiger-server-public-key --query value -o tsv)" pixi run -e replay python scripts/check_zmq.py
+
+# Longer timeout during a running scan to confirm data flows
+SERVER_PUBLIC_KEY="$(az keyvault secret show --vault-name genesisdemoskv --name holoptycho-eiger-server-public-key --query value -o tsv)" pixi run -e replay python scripts/check_zmq.py --timeout 30
 ```
+
+`CLIENT_PUBLIC_KEY` and `CLIENT_SECRET_KEY` are optional for this script — if
+absent it generates a throwaway keypair automatically. The Eiger server uses
+the client key only for encryption, not for allowlisting, so an ephemeral pair
+is sufficient for connectivity checks. The production pipeline (`datasource.py`)
+requires real client keys and will refuse to start with only the server key set.
 
 ---
 
@@ -231,39 +293,15 @@ The pipeline will refuse to start if any of `SERVER_STREAM_SOURCE`, `PANDA_STREA
 
 ## Controlling the pipeline
 
-Use the `hp` CLI to start, stop, and configure the pipeline. It connects to `http://localhost:8000` by default — override with `--url` or `HOLOPTYCHO_URL`.
+Use the `hp` CLI to start, stop, and configure the pipeline.
 
-### Installing the CLI
-
-The `client` pixi environment installs only the CLI and its dependencies — no GPU or Holoscan deps. It works on Linux and macOS:
+### Selecting a remote
 
 ```bash
-git clone git@github.com:NSLS2/holoptycho.git
-cd holoptycho
-pixi install -e client
-pixi run -e client hp --help
-```
-
-To avoid typing `pixi run -e client` each time, add a shell alias. Use `--manifest-path` so it works from any directory:
-
-```bash
-# bash
-echo 'alias hp="pixi run --manifest-path ~/code/holoptycho/pixi.toml -e client hp"' >> ~/.bashrc && source ~/.bashrc
-
-# zsh
-echo 'alias hp="pixi run --manifest-path ~/code/holoptycho/pixi.toml -e client hp"' >> ~/.zshrc && source ~/.zshrc
-```
-
-### Updating the CLI
-
-```bash
-cd ~/code/holoptycho && git pull
-```
-
-If `pixi.lock` changed, also run:
-
-```bash
-pixi install -e client
+hp remote list          # show all remotes (* = active)
+hp remote set           # interactive picker
+hp remote set mars5     # direct
+hp remote status        # show current
 ```
 
 ### Starting and stopping
@@ -284,16 +322,21 @@ Beamline metadata (energy, scan geometry, pixel size) can be pulled directly fro
 ```bash
 tiled profile create https://tiled.nsls2.bnl.gov --name nsls2  # once
 tiled login --profile nsls2
-hp start "$(pixi run -e client config-from-tiled --scan-num 320045)"
+
+# By scan id (most recent run with that id wins)
+hp start "$(pixi run -e client config-from-tiled --scan-id 404611)"
+
+# Or by run UID if you have it
+hp start "$(pixi run -e client config-from-tiled --uid 67e77251-cbe4-444c-8a8c-36491b0b9100)"
 ```
 
 Override reconstruction parameters as needed:
 
 ```bash
-hp start "$(pixi run -e client config-from-tiled --scan-num 320045 --nx 256 --ny 256 --n-iterations 1000)"
+hp start "$(pixi run -e client config-from-tiled --scan-id 404611 --nx 256 --ny 256 --n-iterations 1000)"
 
 # Run only the iterative solver or only the ViT branch (default is both):
-hp start "$(pixi run -e client config-from-tiled --scan-num 320045 --mode iterative)"
+hp start "$(pixi run -e client config-from-tiled --scan-id 404611 --mode iterative)"
 ```
 
 ### Model selection

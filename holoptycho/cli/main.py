@@ -3,12 +3,14 @@
 Connects to a running holoptycho API server and issues commands.
 
 Base URL defaults to http://localhost:8000.
-Override with --url or the HOLOPTYCHO_URL environment variable.
+Override with --url or the HOLOPTYCHO_URL environment variable, or persist
+a default with `hp remote set <name>`.
 """
 
 import json
 import sys
 import time
+from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -20,15 +22,38 @@ app = typer.Typer(help="holoptycho control CLI", no_args_is_help=True)
 model_app = typer.Typer(help="Model management commands", no_args_is_help=True)
 config_app = typer.Typer(help="Config commands", no_args_is_help=True)
 logs_app = typer.Typer(help="Log commands (tail, clear)", invoke_without_command=True)
+remote_app = typer.Typer(
+    help="Manage the active remote API server", no_args_is_help=True
+)
 app.add_typer(model_app, name="model")
 app.add_typer(config_app, name="config")
 app.add_typer(logs_app, name="logs")
+app.add_typer(remote_app, name="remote")
 
 _DEFAULT_URL = "http://localhost:8000"
 
+# Named remotes. Add new entries here as new servers come online.
+REMOTES = {
+    "localhost": "http://localhost:8000",
+    "mars5": "http://mars5.nsls2.bnl.gov:8000",
+}
+
+# Persisted remote config file
+_REMOTE_FILE = Path.home() / ".config" / "holoptycho" / "remote"
+
+
+def _load_remote_url() -> str:
+    """Return the persisted remote URL, or the default if none is set."""
+    try:
+        return _REMOTE_FILE.read_text().strip()
+    except FileNotFoundError:
+        return _DEFAULT_URL
+
 
 def _base_url(ctx: typer.Context) -> str:
-    return ctx.obj.get("url", _DEFAULT_URL) if ctx.obj else _DEFAULT_URL
+    # Explicit --url / HOLOPTYCHO_URL always wins; otherwise use persisted remote.
+    url = (ctx.obj or {}).get("url")
+    return url if url else _load_remote_url()
 
 
 def _client(url: str) -> httpx.Client:
@@ -59,20 +84,23 @@ def _parse_config(config_str: Optional[str]) -> Optional[dict]:
 @app.callback()
 def main(
     ctx: typer.Context,
-    url: str = typer.Option(
+    url: Optional[str] = typer.Option(
         None,
         "--url",
         envvar="HOLOPTYCHO_URL",
-        help="API base URL (default: http://localhost:8000)",
+        help="API base URL (overrides persisted remote set via `hp remote set`)",
     ),
 ):
     ctx.ensure_object(dict)
-    ctx.obj["url"] = url or _DEFAULT_URL
+    ctx.obj["url"] = (
+        url  # None if not explicitly set; _base_url falls back to persisted remote
+    )
 
 
 # ---------------------------------------------------------------------------
 # Pipeline lifecycle
 # ---------------------------------------------------------------------------
+
 
 @app.command()
 def status(ctx: typer.Context):
@@ -138,11 +166,14 @@ def logs(
     ctx: typer.Context,
     lines: int = typer.Option(100, "--lines", "-n", help="Number of log lines to show"),
     follow: bool = typer.Option(
-        False, "--follow", "-f",
+        False,
+        "--follow",
+        "-f",
         help="Stream new log lines as they arrive (Ctrl-C to stop).",
     ),
     interval: float = typer.Option(
-        1.0, "--interval",
+        1.0,
+        "--interval",
         help="Poll interval in seconds when --follow is used.",
     ),
 ):
@@ -211,6 +242,7 @@ def logs_clear(ctx: typer.Context):
 # Config sub-commands
 # ---------------------------------------------------------------------------
 
+
 @config_app.callback()
 def config_callback(ctx: typer.Context):
     ctx.ensure_object(dict)
@@ -231,6 +263,7 @@ def config_show(ctx: typer.Context):
 # Model sub-commands
 # ---------------------------------------------------------------------------
 
+
 @model_app.callback()
 def model_callback(ctx: typer.Context):
     ctx.ensure_object(dict)
@@ -242,7 +275,9 @@ def model_callback(ctx: typer.Context):
 def model_set(
     ctx: typer.Context,
     name: str = typer.Argument(..., help="Model name in Azure ML"),
-    version: Optional[str] = typer.Option(None, "--version", "-v", help="Model version (default: latest)"),
+    version: Optional[str] = typer.Option(
+        None, "--version", "-v", help="Model version (default: latest)"
+    ),
 ):
     """Select a model (downloads and compiles if not cached)."""
     body: dict = {"name": name}
@@ -286,14 +321,76 @@ def model_list(ctx: typer.Context):
 
     typer.echo("")
     if not azure_available:
-        typer.echo("Azure ML: not configured (set AZURE_SUBSCRIPTION_ID, AZURE_RESOURCE_GROUP, AZURE_ML_WORKSPACE)")
+        typer.echo(
+            "Azure ML: not configured (set AZURE_SUBSCRIPTION_ID, AZURE_RESOURCE_GROUP, AZURE_ML_WORKSPACE)"
+        )
     else:
         typer.echo("Azure ML:")
         if azure:
             table = Table("Name", "Version", "Cached", "Description")
             for m in azure:
                 cached = "yes" if m.get("cached") else "no"
-                table.add_row(m["name"], str(m["version"]), cached, m.get("description") or "")
+                table.add_row(
+                    m["name"], str(m["version"]), cached, m.get("description") or ""
+                )
             rprint(table)
         else:
             typer.echo("  (no models found in Azure ML)")
+
+
+# ---------------------------------------------------------------------------
+# Remote sub-commands
+# ---------------------------------------------------------------------------
+
+
+@remote_app.callback()
+def remote_callback(ctx: typer.Context):
+    ctx.ensure_object(dict)
+    if ctx.parent and ctx.parent.obj:
+        ctx.obj.update(ctx.parent.obj)
+
+
+@remote_app.command("list")
+def remote_list():
+    """List all available remotes."""
+    current = _load_remote_url()
+    for name, url in REMOTES.items():
+        active = "*" if url == current else " "
+        typer.echo(f"  {active} {name}  ({url})")
+
+
+@remote_app.command("set")
+def remote_set(
+    name: Optional[str] = typer.Argument(
+        None, help=f"Remote name: {', '.join(REMOTES)}"
+    ),
+):
+    """Set the active remote API server (persisted across sessions)."""
+    if name is None:
+        choices = list(REMOTES.keys())
+        for i, key in enumerate(choices, 1):
+            typer.echo(f"  {i}. {key}  ({REMOTES[key]})")
+        raw = typer.prompt("Select")
+        if raw.isdigit() and 1 <= int(raw) <= len(choices):
+            name = choices[int(raw) - 1]
+        elif raw in REMOTES:
+            name = raw
+        else:
+            typer.echo(f"Invalid selection {raw!r}", err=True)
+            raise typer.Exit(1)
+    elif name not in REMOTES:
+        valid = ", ".join(REMOTES)
+        typer.echo(f"Unknown remote {name!r}. Available: {valid}", err=True)
+        raise typer.Exit(1)
+    url = REMOTES[name]
+    _REMOTE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _REMOTE_FILE.write_text(url)
+    typer.echo(f"Remote set to {name}  ({url})")
+
+
+@remote_app.command("status")
+def remote_status():
+    """Show the current active remote."""
+    url = _load_remote_url()
+    name = next((k for k, v in REMOTES.items() if v == url), "custom")
+    typer.echo(f"{name}  {url}")

@@ -13,11 +13,14 @@ Usage
     # Print config JSON for a specific run UID
     python scripts/config_from_tiled.py --uid 67e77251-cbe4-444c-8a8c-36491b0b9100
 
+    # Look up by scan id (most recent match wins)
+    python scripts/config_from_tiled.py --scan-id 404611
+
     # Pipe directly into hp start
-    hp start "$(python scripts/config_from_tiled.py --uid 67e77251-cbe4-444c-8a8c-36491b0b9100)"
+    hp start "$(pixi run -e client config-from-tiled --scan-id 404611)"
 
     # Override reconstruction parameters
-    python scripts/config_from_tiled.py --uid 67e77251-cbe4-444c-8a8c-36491b0b9100 \\
+    python scripts/config_from_tiled.py --scan-id 404611 \\
         --nx 256 --ny 256 --n-iterations 1000 --alg-flag DM
 """
 
@@ -155,7 +158,9 @@ def open_tiled_node(tiled_url: str, *, timeout_s: float = 300.0):
 
     for split_index in range(len(path_parts) - 1, -1, -1):
         base_path = "/" + "/".join(path_parts[:split_index]) if split_index else ""
-        base_url = urlunsplit((parsed.scheme, parsed.netloc, base_path, parsed.query, parsed.fragment))
+        base_url = urlunsplit(
+            (parsed.scheme, parsed.netloc, base_path, parsed.query, parsed.fragment)
+        )
         try:
             root = from_uri(base_url, timeout=timeout)
         except ClientError as exc:
@@ -399,7 +404,9 @@ def load_config_from_tiled(
         dcm_th = float(baseline["dcm_th"].read()[0])
         energy_kev = _energy_from_dcm_th(dcm_th)
     except Exception as exc:
-        print(f"WARNING: could not read DCM angle from baseline: {exc}", file=sys.stderr)
+        print(
+            f"WARNING: could not read DCM angle from baseline: {exc}", file=sys.stderr
+        )
         energy_kev = 0.0
 
     # --- Scan geometry ---
@@ -411,7 +418,10 @@ def load_config_from_tiled(
     # The 2D_FLY_PANDA branch was previously subtracting one dr from the range
     # and storing the *unscaled* dr — both wrong relative to ptycho_gui output.
     try:
-        if scan_md.get("type") == "2D_FLY_PANDA" and len(scan_md.get("scan_input", [])) >= 6:
+        if (
+            scan_md.get("type") == "2D_FLY_PANDA"
+            and len(scan_md.get("scan_input", [])) >= 6
+        ):
             scan_input = scan_md["scan_input"]
             x_range = scan_input[1] - scan_input[0]
             y_range = scan_input[4] - scan_input[3]
@@ -447,7 +457,10 @@ def load_config_from_tiled(
             x_range -= dr_x
             y_range -= dr_y
     except Exception as exc:
-        print(f"WARNING: could not parse scan geometry from plan_args: {exc}", file=sys.stderr)
+        print(
+            f"WARNING: could not parse scan geometry from plan_args: {exc}",
+            file=sys.stderr,
+        )
         x_range = y_range = dr_x = dr_y = 0.0
         x_num = y_num = 0
 
@@ -461,7 +474,9 @@ def load_config_from_tiled(
         else:
             angle = float(baseline["dsth"].read()[0])
     except Exception as exc:
-        print(f"WARNING: could not read stage angle from baseline: {exc}", file=sys.stderr)
+        print(
+            f"WARNING: could not read stage angle from baseline: {exc}", file=sys.stderr
+        )
         angle = 0.0
 
     lambda_nm = _lambda_from_energy(energy_kev) if energy_kev > 0 else 0.0
@@ -521,31 +536,56 @@ def add_reconstruction_arguments(parser: argparse.ArgumentParser):
         "These are not in the scan metadata and must be set explicitly.",
     )
     recon.add_argument("--working-directory", default="/ptycho_gui_holoscan")
-    recon.add_argument("--nx", type=int, default=256,
-                       help="Detector-frame crop width; must match the selected engine's input "
-                            "width (default: 256, matching current HXN engines).")
-    recon.add_argument("--ny", type=int, default=256,
-                       help="Detector-frame crop height; must match the selected engine's input "
-                            "height (default: 256, matching current HXN engines).")
+    recon.add_argument(
+        "--nx",
+        type=int,
+        default=256,
+        help="Detector-frame crop width; must match the selected engine's input "
+        "width (default: 256, matching current HXN engines).",
+    )
+    recon.add_argument(
+        "--ny",
+        type=int,
+        default=256,
+        help="Detector-frame crop height; must match the selected engine's input "
+        "height (default: 256, matching current HXN engines).",
+    )
     # batch-width/height default to nx/ny (substituted in build_full_config
     # when None) — they're almost always equal to the recon frame size.
-    recon.add_argument("--batch-width", type=int, default=None,
-                       help="Detector crop width in pixels (default: --nx).")
-    recon.add_argument("--batch-height", type=int, default=None,
-                       help="Detector crop height in pixels (default: --ny).")
+    recon.add_argument(
+        "--batch-width",
+        type=int,
+        default=None,
+        help="Detector crop width in pixels (default: --nx).",
+    )
+    recon.add_argument(
+        "--batch-height",
+        type=int,
+        default=None,
+        help="Detector crop height in pixels (default: --ny).",
+    )
     # batch-x0/y0 default to None and are auto-computed from the diffraction
     # center of the first frames if the replay script has the data on hand.
-    recon.add_argument("--batch-x0", type=int, default=None,
-                       help="Detector crop column offset (default: auto from "
-                            "diffraction center of mass).")
-    recon.add_argument("--batch-y0", type=int, default=None,
-                       help="Detector crop row offset (default: auto from "
-                            "diffraction center of mass).")
+    recon.add_argument(
+        "--batch-x0",
+        type=int,
+        default=None,
+        help="Detector crop column offset (default: auto from "
+        "diffraction center of mass).",
+    )
+    recon.add_argument(
+        "--batch-y0",
+        type=int,
+        default=None,
+        help="Detector crop row offset (default: auto from "
+        "diffraction center of mass).",
+    )
     recon.add_argument("--det-roix0", type=int, default=0)
     recon.add_argument("--det-roiy0", type=int, default=0)
     recon.add_argument("--gpu-batch-size", type=int, default=256)
-    recon.add_argument("--distance", type=float, default=0.5,
-                       help="Sample-to-detector distance in m")
+    recon.add_argument(
+        "--distance", type=float, default=0.5, help="Sample-to-detector distance in m"
+    )
     recon.add_argument("--alg-flag", default="ML_grad")
     recon.add_argument("--n-iterations", type=int, default=500)
     recon.add_argument("--gpus", default="[0]")
@@ -583,48 +623,50 @@ def build_full_config(run_uid: str, tiled_url: str, args: argparse.Namespace) ->
     batch_x0 = args.batch_x0 if args.batch_x0 is not None else 0
     batch_y0 = args.batch_y0 if args.batch_y0 is not None else 0
 
-    config.update({
-        # Provenance for the per-run Tiled container metadata.
-        "raw_uid": run_uid,
-        "scan_id": str(scan_num),
-        "working_directory": args.working_directory,
-        "shm_name": f"ptycho_{scan_num}",
-        "nx": str(args.nx),
-        "ny": str(args.ny),
-        "batch_width": str(batch_width),
-        "batch_height": str(batch_height),
-        "batch_x0": str(batch_x0),
-        "batch_y0": str(batch_y0),
-        "det_roix0": str(args.det_roix0),
-        "det_roiy0": str(args.det_roiy0),
-        "gpu_batch_size": str(args.gpu_batch_size),
-        "distance": str(args.distance),
-        "nz": str(int(config["x_num"]) * int(config["y_num"])),
-        "x_arr_size": config["x_num"],
-        "y_arr_size": config["y_num"],
-        "alg_flag": args.alg_flag,
-        "alg2_flag": args.alg_flag,
-        "alg_percentage": "0.5",
-        "n_iterations": str(args.n_iterations),
-        "ml_mode": "Poisson",
-        # Match ptycho_gui's tuned values for HXN scans. ml_weight=5.0 was
-        # too aggressive and caused NaN divergence on scans with tight
-        # clipping bounds.
-        "ml_weight": "0.1",
-        "beta": "0.9",
-        "init_obj_flag": "True",
-        "init_prb_flag": "True",
-        "prb_path": "",
-        "prb_mode_num": "1",
-        "obj_mode_num": "1",
-        "gpu_flag": "True",
-        "gpus": args.gpus,
-        "precision": "single",
-        "nth": "5",
-        "sign": args.sign,
-        "display_interval": str(args.display_interval),
-        "recon_mode": args.mode,
-    })
+    config.update(
+        {
+            # Provenance for the per-run Tiled container metadata.
+            "raw_uid": run_uid,
+            "scan_id": str(scan_num),
+            "working_directory": args.working_directory,
+            "shm_name": f"ptycho_{scan_num}",
+            "nx": str(args.nx),
+            "ny": str(args.ny),
+            "batch_width": str(batch_width),
+            "batch_height": str(batch_height),
+            "batch_x0": str(batch_x0),
+            "batch_y0": str(batch_y0),
+            "det_roix0": str(args.det_roix0),
+            "det_roiy0": str(args.det_roiy0),
+            "gpu_batch_size": str(args.gpu_batch_size),
+            "distance": str(args.distance),
+            "nz": str(int(config["x_num"]) * int(config["y_num"])),
+            "x_arr_size": config["x_num"],
+            "y_arr_size": config["y_num"],
+            "alg_flag": args.alg_flag,
+            "alg2_flag": args.alg_flag,
+            "alg_percentage": "0.5",
+            "n_iterations": str(args.n_iterations),
+            "ml_mode": "Poisson",
+            # Match ptycho_gui's tuned values for HXN scans. ml_weight=5.0 was
+            # too aggressive and caused NaN divergence on scans with tight
+            # clipping bounds.
+            "ml_weight": "0.1",
+            "beta": "0.9",
+            "init_obj_flag": "True",
+            "init_prb_flag": "True",
+            "prb_path": "",
+            "prb_mode_num": "1",
+            "obj_mode_num": "1",
+            "gpu_flag": "True",
+            "gpus": args.gpus,
+            "precision": "single",
+            "nth": "5",
+            "sign": args.sign,
+            "display_interval": str(args.display_interval),
+            "recon_mode": args.mode,
+        }
+    )
 
     return config
 
@@ -635,10 +677,15 @@ def main():
         epilog=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument(
+    uid_group = parser.add_mutually_exclusive_group(required=True)
+    uid_group.add_argument(
         "--uid",
-        required=True,
-        help="Bluesky run UID",
+        help="Bluesky run UID (UUID4)",
+    )
+    uid_group.add_argument(
+        "--scan-id",
+        type=int,
+        help="Scan id (integer). Looks up the most recent run with this scan_id in hxn/raw.",
     )
     parser.add_argument(
         "--tiled-url",
@@ -649,7 +696,8 @@ def main():
     add_reconstruction_arguments(parser)
 
     args = parser.parse_args()
-    config = build_full_config(args.uid, tiled_url=args.tiled_url, args=args)
+    uid = args.uid or lookup_uid_by_scan_id(args.tiled_url, args.scan_id)
+    config = build_full_config(uid, tiled_url=args.tiled_url, args=args)
 
     print(json.dumps(config, indent=2))
 

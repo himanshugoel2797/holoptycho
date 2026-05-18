@@ -281,7 +281,67 @@ talks to `http://localhost:8000` as normal.
 
 ---
 
+## Verifying ZMQ connectivity
+
+Before starting a live run, use `scripts/check_zmq.py` to confirm both streams
+are reachable and the CurveZMQ key is accepted. It uses the `replay` pixi env
+(no GPU or Holoscan required).
+
+```bash
+pixi install -e replay  # once
+
+# Run the check — passes SERVER_PUBLIC_KEY inline so it never touches disk
+SERVER_PUBLIC_KEY="$(az keyvault secret show --vault-name genesisdemoskv --name holoptycho-eiger-server-public-key --query value -o tsv)" pixi run -e replay python scripts/check_zmq.py
+
+# Longer timeout during an active scan to confirm data flows
+SERVER_PUBLIC_KEY="..." pixi run -e replay python scripts/check_zmq.py --timeout 30
+```
+
+Outcomes per stream:
+
+| Result | Meaning |
+|---|---|
+| `OK` | Connected and received data — detector armed / scan running |
+| `TIMEOUT` | Connected fine, no data — no scan running (expected when idle) |
+| `ERROR` | Failed to connect — wrong key, host unreachable, or port closed |
+
+`TIMEOUT` with no scan running is the expected result when confirming a new
+deployment. `ERROR` means something is actually wrong.
+
+`CLIENT_PUBLIC_KEY` / `CLIENT_SECRET_KEY` are optional for this script — it
+generates a throwaway keypair automatically when only `SERVER_PUBLIC_KEY` is
+set. The production pipeline (`EigerZmqRxOp` in `datasource.py`) requires all
+three keys and will raise `RuntimeError` if only some are set.
+
+---
+
 ## CLI reference
+
+### Remote management
+
+By default `hp` connects to `http://localhost:8000`. Use `hp remote` to
+switch to a different server and persist the choice across sessions:
+
+```bash
+# List all remotes (* marks the active one)
+hp remote list
+
+# Show current active remote
+hp remote status
+
+# Switch to mars5 (persisted to ~/.config/holoptycho/remote)
+hp remote set mars5
+
+# Switch back to localhost
+hp remote set localhost
+```
+
+Named remotes: `localhost` (`http://localhost:8000`), `mars5` (`http://mars5.nsls2.bnl.gov:8000`).
+
+`--url` / `HOLOPTYCHO_URL` always override the persisted remote for a single invocation:
+```bash
+HOLOPTYCHO_URL=http://mars5.nsls2.bnl.gov:8000 hp status
+```
 
 ### Pipeline lifecycle
 
@@ -453,13 +513,13 @@ lambda_nm = (6.62607e-34 * 2.99792e8) / (energy_kev * 1e3 * 1.60218e-19) * 1e9
 # 1. Pull beamline metadata from Tiled and start the pipeline
 tiled profile create https://tiled.nsls2.bnl.gov --name nsls2  # once
 tiled login --profile nsls2
-hp start "$(pixi run -e client config-from-tiled --scan-num 320045)"
+hp start "$(pixi run -e client config-from-tiled --scan-id 320045)"
 
 # 2. (Optional) Override reconstruction parameters
-hp start "$(pixi run -e client config-from-tiled --scan-num 320045 --nx 256 --n-iterations 1000)"
+hp start "$(pixi run -e client config-from-tiled --scan-id 320045 --nx 256 --n-iterations 1000)"
 
 # 2b. (Optional) Pick which reconstruction branches to run
-hp start "$(pixi run -e client config-from-tiled --scan-num 320045 --mode iterative)"  # or vit | both (default)
+hp start "$(pixi run -e client config-from-tiled --scan-id 320045 --mode iterative)"  # or vit | both (default)
 
 # 3. (Optional) Switch to a different model
 hp model set my_vit_model --version 3
@@ -471,7 +531,7 @@ hp logs --lines 200
 hp stop
 
 # 6. For the next scan: restart with a new config
-hp restart "$(pixi run -e client config-from-tiled --scan-num 320046)"
+hp restart "$(pixi run -e client config-from-tiled --scan-id 320046)"
 ```
 
 ---
@@ -503,6 +563,29 @@ hp restart "$(pixi run -e client config-from-tiled --scan-num 320046)"
 ### Fetching the certificate for container launch
 
 All values are resolved at runtime via `az cli` — no IDs hardcoded:
+
+> **If `hp model list` / `hp model set` returns `Authentication failed: AADSTS700027`
+> (certificate not registered on application)**, the public key in the app
+> registration is out of sync with the private key in Key Vault. Fix it by
+> re-uploading the public key:
+>
+> ```bash
+> az keyvault certificate download \
+>   --vault-name genesisdemoskv \
+>   --name holoptycho-sp-cert \
+>   --encoding PEM \
+>   --file /tmp/holoptycho-sp-cert.pem
+>
+> az ad app credential reset \
+>   --id "$(az ad app list --display-name 'NSLS2-Genesis-Holoptycho' --query '[0].appId' -o tsv)" \
+>   --cert @/tmp/holoptycho-sp-cert.pem \
+>   --append
+>
+> rm /tmp/holoptycho-sp-cert.pem
+> ```
+>
+> This happens when the cert in Key Vault is rotated/replaced without
+> re-registering the new public key on the app registration.
 
 ```bash
 docker run --pull=always --gpus all -p 127.0.0.1:8000:8000 --shm-size=32g \

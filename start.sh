@@ -26,14 +26,16 @@ set -euo pipefail
 DETACH=0
 USE_API_KEY=0
 LIVE=0
+EXPOSE=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -d|--detach) DETACH=1 ;;
     --api-key) USE_API_KEY=1 ;;
     --live) LIVE=1 ;;
+    --expose) EXPOSE=1 ;;
     -h|--help)
       cat <<'USAGE'
-Usage: ./start.sh [-d|--detach] [--api-key] [--live]
+Usage: ./start.sh [-d|--detach] [--api-key] [--live] [--expose]
 
   -d, --detach   Run the container detached. The script prints the
                  logs/stop commands and exits.
@@ -44,6 +46,10 @@ Usage: ./start.sh [-d|--detach] [--api-key] [--live]
                  Eiger CurveZMQ server public key from Key Vault.
                  Without this flag the container listens on localhost
                  ports 5555/5556 for the replay script.
+  --expose       Bind the API port to 0.0.0.0 instead of 127.0.0.1 so
+                 other machines on the network can reach it directly at
+                 http://<hostname>:8000. By default the port is only
+                 accessible on localhost (via SSH tunnel).
 USAGE
       exit 0
       ;;
@@ -110,13 +116,15 @@ export SERVER_STREAM_SOURCE PANDA_STREAM_SOURCE
 # --- Run the container -----------------------------------------------------
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 
+BIND_ADDR="$([[ $EXPOSE -eq 1 ]] && echo "0.0.0.0" || echo "127.0.0.1")"
+
 run_args=(
   --rm
   --name "$CONTAINER_NAME"
   --pull=always
   --gpus all
   --shm-size=32g
-  -p "127.0.0.1:${HOST_PORT}:8000"
+  -p "${BIND_ADDR}:${HOST_PORT}:8000"
   # host-gateway resolves to the host's gateway IP from inside the
   # container; works under both Docker Desktop (WSL2) and rootless podman
   # (slurm). Lets the container reach the replay script's ZMQ publishers
