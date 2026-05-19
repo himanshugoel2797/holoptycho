@@ -26,9 +26,12 @@ logger = logging.getLogger("holoptycho.tiled_writer")
 _DEFAULT_CATALOG_PATH = "hxn/processed/holoptycho"
 _SPECS = ["synaps_project"]
 # Access tags gate which API keys can read/write this node. The holoptycho API
-# key is scoped to {'synaps_project', 'hxn_beamline', 'public'}, so every
-# container/array we create must carry one of these tags or Tiled returns 403.
-_ACCESS_TAGS = ["synaps_project"]
+# key is scoped to {'synaps_project', 'hxn_processed', 'hxn_beamline', 'public'},
+# so every container/array we create must carry one of these tags or Tiled
+# returns 403. We stamp both 'synaps_project' (cross-project umbrella) and
+# 'hxn_processed' (per-beamline-output) so consumers scoped to either tag
+# can read these datasets.
+_ACCESS_TAGS = ["synaps_project", "hxn_processed"]
 
 
 def _get_or_create(container, key: str):
