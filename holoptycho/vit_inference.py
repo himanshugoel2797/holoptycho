@@ -20,6 +20,7 @@ import time
 import numpy as np
 
 from holoscan.core import Operator, OperatorSpec, ConditionType, IOSpec
+from ptychoml.preprocess import apply_d4, D4_NAMES
 from .mosaic_stitch import stitch_batch_into
 from .tiled_writer import get_writer
 
@@ -65,11 +66,16 @@ class PtychoViTInferenceOp(Operator):
         vit_result: tuple(pred, indices) where pred is [B, 2, H, W] or [B, H, W]
 
     Parameters:
-        engine_path:       Path to .engine file (must match batch size B)
-        gpu:               CUDA device ordinal (default 1; leave 0 for PtychoRecon)
-        output_save_dir:   Directory for saving predictions (default /data/users/Holoscan)
-        data_is_shifted:   If True, input diff_amp has been fftshift'd and
-                           should be undone before inference.
+        engine_path:     Path to .engine file (must match batch size B)
+        gpu:             CUDA device ordinal (default 1; leave 0 for PtychoRecon)
+        output_save_dir: Directory for saving predictions (default /data/users/Holoscan)
+        fftshift:        DC-convention override for the session. Default
+                         ``None`` lets ptychoml auto-detect the central beam
+                         location per batch (via
+                         ``ptychoml.detect_dc_at_corner``) and shift only when
+                         needed — robust against an upstream op changing its
+                         own fftshift policy. Pass ``True``/``False`` to force
+                         a fixed convention (rarely needed).
     """
 
     def __init__(
@@ -79,7 +85,7 @@ class PtychoViTInferenceOp(Operator):
         engine_path: str,
         gpu: int = 1,
         output_save_dir: str = "/data/users/Holoscan",
-        data_is_shifted: bool = False,
+        fftshift: bool | None = None,
         **kwargs,
     ):
         super().__init__(fragment, *args, **kwargs)
@@ -87,7 +93,7 @@ class PtychoViTInferenceOp(Operator):
         self.engine_path = engine_path
         self.gpu = gpu
         self.output_save_dir = output_save_dir
-        self._data_is_shifted = data_is_shifted
+        self._fftshift = fftshift
 
         # Lazy-initialized on first compute()
         self._session = None
@@ -112,10 +118,17 @@ class PtychoViTInferenceOp(Operator):
                 "PyCUDA + CuPy on the same GPU from different threads can cause "
                 "CUDA context crashes. Use gpu=1 on multi-GPU systems."
             )
+        # fftshift=None (default) tells ptychoml to auto-detect the DC
+        # convention per batch. The model is trained on central-beam-at-
+        # center data; ImagePreprocessorOp now also auto-detects, so the
+        # session typically sees DC-already-at-center and no-ops. Auto is
+        # idempotent and cheap (~one ndarray.sum), so leaving it on here
+        # gives us defense-in-depth without forcing the pipeline to track
+        # which upstream stage settled the convention.
         self._session = PtychoViTInference(
             engine_path=self.engine_path,
             gpu=self.gpu,
-            data_is_shifted=self._data_is_shifted,
+            fftshift=self._fftshift,
         )
         self._session._init_engine()
         self.engine_batch_size = int(self._session.expected_input_shape[0])
@@ -259,7 +272,7 @@ class SaveViTResult(Operator):
         phase_channel_index: int = 1,
         overshoot_factor: float = 1.2,
         enable_batch_writes: bool = False,
-        antidiag_flip_patches: bool = False,
+        patch_flip: str = 'identity',
         **kwargs,
     ):
         # Holoscan's Operator.__init__ calls setup(spec), so any attribute
@@ -269,12 +282,18 @@ class SaveViTResult(Operator):
         super().__init__(fragment, *args, **kwargs)
         self.batch_num = 0
         self.max_index_seen = -1
-        # Anti-diagonal flip per predicted patch before stitching. Required
-        # for HXN data: the object-domain array axes are reflected across the
-        # anti-diagonal relative to the probe/dp frame, so patches stitched
-        # without this correction come out mirrored relative to the scan grid.
-        # Equivalent to ``transpose(0, 2, 1)[:, ::-1, ::-1]``.
-        self._antidiag_flip_patches = antidiag_flip_patches
+        # D4 transform applied to each predicted patch before stitching, to
+        # map model-output frame → canvas/object frame. 'identity' = no-op.
+        # Historical HXN default was 'antitranspose' (transpose ∘ flip(both))
+        # because the model's output axes were reflected across the anti-
+        # diagonal relative to the probe/dp frame. The orientation
+        # auto-detector ([[ptychoml.autodetect_orientation]]) picks the
+        # right D4 from the data; this is the static fallback.
+        if patch_flip not in D4_NAMES:
+            raise ValueError(
+                f"patch_flip must be one of {D4_NAMES}; got {patch_flip!r}"
+            )
+        self._patch_flip = patch_flip
         # Optional callable returning the latest (n, 2) per-frame positions
         # array (microns) — typically lambda: point_proc.positions_um. When
         # supplied, the snapshot is published alongside each ViT batch so
@@ -430,8 +449,8 @@ class SaveViTResult(Operator):
 
         def _extract_channel(ch_idx: int) -> np.ndarray:
             patches = pred[:, ch_idx].astype(np.float32, copy=False)
-            if self._antidiag_flip_patches:
-                patches = patches.transpose(0, 2, 1)[:, ::-1, ::-1]
+            if self._patch_flip != 'identity':
+                patches = apply_d4(patches, self._patch_flip)
             if self._inner_crop > 0:
                 c = self._inner_crop
                 patches = patches[:, c:-c, c:-c]
