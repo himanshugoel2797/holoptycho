@@ -562,10 +562,15 @@ class PtychoApp(Application):
         ))
 
     def config_ops(self,param):
-
-        nx_prb = self.pty.recon.nx_prb
-        ny_prb = self.pty.recon.ny_prb
-        nz = self.pty.recon.num_points
+        has_recon = hasattr(self, 'pty')
+        if has_recon:
+            nx_prb = self.pty.recon.nx_prb
+            ny_prb = self.pty.recon.ny_prb
+            nz = self.pty.recon.num_points
+        else:
+            nx_prb = int(param.nx)
+            ny_prb = int(param.ny)
+            nz = int(getattr(param, "live_num_points_max", 0)) or 8192
 
         self.image_batch.roi = None
         self.image_batch.batchsize = self.batchsize
@@ -578,11 +583,13 @@ class PtychoApp(Application):
         self.image_proc.detmap_threshold = 0
         self.image_proc.badpixels = np.array([])
 
-        self.image_send.diff_d_target = self.pty.recon.diff_d
+        if has_recon:
+            self.image_send.diff_d_target = self.pty.recon.diff_d
         self.image_send.max_points = nz
 
         self.point_proc.point_info = np.zeros((nz,4),dtype = np.int32)
-        self.point_proc.point_info_target = self.pty.recon.point_info_d
+        if has_recon:
+            self.point_proc.point_info_target = self.pty.recon.point_info_d
         # Per-frame scan positions (microns), filled by PointProcessorOp as
         # PandA data arrives. Read by SaveViTResult and published to tiled
         # so the dashboard mosaic stitcher uses real positions.
@@ -590,19 +597,31 @@ class PtychoApp(Application):
 
         self.point_proc.min_points = self.min_points
         self.point_proc.max_points = nz
-        self.point_proc.x_direction = self.pty.recon.x_direction
-        self.point_proc.y_direction = self.pty.recon.y_direction
-        self.point_proc.x_range_um = self.pty.recon.x_range_um
-        self.point_proc.y_range_um = self.pty.recon.y_range_um
-        self.point_proc.x_pixel_m = self.pty.recon.x_pixel_m
-        self.point_proc.y_pixel_m = self.pty.recon.y_pixel_m
+        if has_recon:
+            self.point_proc.x_direction = self.pty.recon.x_direction
+            self.point_proc.y_direction = self.pty.recon.y_direction
+            self.point_proc.x_range_um = self.pty.recon.x_range_um
+            self.point_proc.y_range_um = self.pty.recon.y_range_um
+            self.point_proc.x_pixel_m = self.pty.recon.x_pixel_m
+            self.point_proc.y_pixel_m = self.pty.recon.y_pixel_m
+            self.point_proc.obj_pad = self.pty.recon.obj_pad
+        else:
+            # vit-only: compute pixel size from config so process_point_info
+            # can convert encoder counts to micron scan positions correctly.
+            _lnm = float(getattr(param, "lambda_nm", None) or
+                         (1.2398 / float(param.xray_energy_kev)))
+            _zm = float(getattr(param, "z_m", 0.0))
+            _ccdpx = float(getattr(param, "ccd_pixel_um", 55.0))
+            if _zm and _ccdpx and nx_prb and ny_prb:
+                self.point_proc.x_pixel_m = _lnm * 1e-9 * _zm / (nx_prb * _ccdpx * 1e-6)
+                self.point_proc.y_pixel_m = _lnm * 1e-9 * _zm / (ny_prb * _ccdpx * 1e-6)
+            self.point_proc.obj_pad = int(getattr(param, "obj_pad", 4))
         self.point_proc.nx_prb = nx_prb
         self.point_proc.ny_prb = ny_prb
-        self.point_proc.obj_pad = self.pty.recon.obj_pad
-
         self.point_proc.angle_correction_flag = param.angle_correction_flag
 
-        self.pty.num_points_min = self.min_points
+        if has_recon:
+            self.pty.num_points_min = self.min_points
 
 
 
@@ -692,10 +711,14 @@ class PtychoApp(Application):
             name="point_proc",
         )
 
-        self.pty = PtychoRecon(self, param=self.param, name='pty')
-
-        self.o = SaveResult(self, name='out')
-        self.live_result = SaveLiveResult(self, name='live_result')
+        # PtychoRecon (CuPy/DM solver) is only instantiated when the iterative
+        # branch is active. In vit-only mode, skipping it prevents a CuPy CUDA
+        # context from being created on GPU 0, which would clash with the
+        # PyCUDA context opened by PtychoViTInferenceOp on the same device.
+        if recon_mode in ("iterative", "both"):
+            self.pty = PtychoRecon(self, param=self.param, name='pty')
+            self.o = SaveResult(self, name='out')
+            self.live_result = SaveLiveResult(self, name='live_result')
 
         self.config_ops(self.param)
 
@@ -731,18 +754,19 @@ class PtychoApp(Application):
                 np.linspace(0, self.param.y_range, y_num + 1)[:-1], [x_num, 1]
             ).T.reshape((x_num * y_num,)) * self.point_proc.y_direction
 
-        # PtychoRecon: reset engine for this scan.
-        self.pty.recon.reset_for_scan(
-            scan_num=str(self.param.scan_num),
-            x_range_um=np.abs(self.param.x_range),
-            y_range_um=np.abs(self.param.y_range),
-            num_points_max=num_points_max,
-        )
-        self.pty.num_points_min = num_points_max
-        self.pty.points_total = nz
-        if self.pty.num_points_min < self.pty.recon.gpu_batch_size:
-            self.pty.num_points_min = self.pty.recon.gpu_batch_size
-        self.pty.probe_initialized = False
+        # PtychoRecon: reset engine for this scan (iterative/both only).
+        if recon_mode in ("iterative", "both"):
+            self.pty.recon.reset_for_scan(
+                scan_num=str(self.param.scan_num),
+                x_range_um=np.abs(self.param.x_range),
+                y_range_um=np.abs(self.param.y_range),
+                num_points_max=num_points_max,
+            )
+            self.pty.num_points_min = num_points_max
+            self.pty.points_total = nz
+            if self.pty.num_points_min < self.pty.recon.gpu_batch_size:
+                self.pty.num_points_min = self.pty.recon.gpu_batch_size
+            self.pty.probe_initialized = False
 
         # Override the positions_um buffer that config_ops sized to
         # `pty.recon.num_points` (the recon engine's max-points cap, default
@@ -755,8 +779,24 @@ class PtychoApp(Application):
         # Each pipeline run gets a fresh container in Tiled keyed by its own uid.
         # Metadata captures the raw scan being reconstructed plus the scan-grid
         # geometry that downstream consumers (synaps-dash) need to stitch
-        # per-frame ViT predictions into a global mosaic. Done after
-        # reset_for_scan so x_pixel_m is populated from the engine.
+        # per-frame ViT predictions into a global mosaic.
+        # Pixel size: derived from the recon engine when available (iterative/both),
+        # otherwise computed directly from config params (vit-only, no CuPy context).
+        if hasattr(self, 'pty'):
+            _x_pixel_m = float(self.pty.recon.x_pixel_m)
+            _y_pixel_m = float(self.pty.recon.y_pixel_m)
+            _lambda_nm = float(self.pty.recon.lambda_nm)
+        else:
+            _lambda_nm = float(getattr(self.param, "lambda_nm", None) or
+                               (1.2398 / float(self.param.xray_energy_kev)))
+            _z_m = float(getattr(self.param, "z_m", 0.0))
+            _ccd_px = float(getattr(self.param, "ccd_pixel_um", 55.0))
+            _nx, _ny = int(self.param.nx), int(self.param.ny)
+            if _z_m and _ccd_px and _nx and _ny:
+                _x_pixel_m = _lambda_nm * 1e-9 * _z_m / (_nx * _ccd_px * 1e-6)
+                _y_pixel_m = _lambda_nm * 1e-9 * _z_m / (_ny * _ccd_px * 1e-6)
+            else:
+                _x_pixel_m = _y_pixel_m = 0.0
         self.run_uid = uuid.uuid4().hex
         run_metadata = {
             "scan_num": str(self.param.scan_num),
@@ -766,8 +806,8 @@ class PtychoApp(Application):
             ),
             "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "recon_mode": recon_mode,
-            "x_pixel_m": float(self.pty.recon.x_pixel_m),
-            "y_pixel_m": float(self.pty.recon.y_pixel_m),
+            "x_pixel_m": _x_pixel_m,
+            "y_pixel_m": _y_pixel_m,
             "x_num": int(self.param.x_num),
             "y_num": int(self.param.y_num),
             "x_range_um": float(np.abs(self.param.x_range)),
@@ -775,7 +815,7 @@ class PtychoApp(Application):
             "x_direction": float(self.param.x_direction),
             "y_direction": float(self.param.y_direction),
             "xray_energy_kev": float(getattr(self.param, "xray_energy_kev", 0.0)),
-            "wavelength_m": float(self.pty.recon.lambda_nm) * 1e-9,
+            "wavelength_m": _lambda_nm * 1e-9,
             "distance_m": float(getattr(self.param, "z_m", 0.0)),
             # True iff this run's iterative branch will populate final/probe
             # and final/object — the supervised targets ptycho-vit's training
@@ -851,9 +891,9 @@ class PtychoApp(Application):
         self.vit_save = SaveViTResult(
             self,
             positions_provider=lambda: self.point_proc.positions_um,
-            pixel_size_m=float(self.pty.recon.x_pixel_m),
-            x_range_um=float(self.pty.recon.x_range_um),
-            y_range_um=float(self.pty.recon.y_range_um),
+            pixel_size_m=_x_pixel_m,
+            x_range_um=float(np.abs(self.param.x_range)),
+            y_range_um=float(np.abs(self.param.y_range)),
             overshoot_factor=mosaic_overshoot,
             enable_batch_writes=enable_batch_writes,
             patch_flip=str(getattr(self.param, "patch_flip", "identity")),

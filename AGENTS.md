@@ -557,6 +557,9 @@ starts, the JSON is serialised to an INI file with a single `[GUI]` section.
 | `nx`, `ny` | int (str) | Reconstruction array size (pixels) |
 | `batch_width`, `batch_height` | int (str) | Diffraction pattern tile size |
 | `batch_x0`, `batch_y0` | int (str) | Top-left crop offset in the detector frame |
+| `det_roix0`, `det_roiy0` | int (str) | **Required.** Detector hardware ROI origin (pixels). The column/row offset at which the Eiger hardware ROI window begins on the chip. Use `"0"`, `"0"` unless a non-zero hardware ROI was configured at the beamline. |
+| `x_num`, `y_num` | int (str) | **Required.** Number of scan positions on the fast and slow axes. Equals `x_arr_size` and `y_arr_size` in legacy ptycho_gui INI files. Used to allocate the object grid and compute `nz = x_num × y_num`. |
+| `x_ratio`, `y_ratio` | float (str) | **Required.** Encoder-counts → µm scale factor for each axis. Derived from Bluesky start doc fields `x_scale_factor` / `z_scale_factor` via `_ratio_from_scale(v) = -v / 10000`. **Not present in legacy ptycho_gui INI files** — must come from Tiled (use `config-from-tiled --scan-id <N>`). |
 | `gpu_batch_size` | int (str) | Number of patterns per GPU batch |
 | `recon_mode` | str | Which reconstruction branches to wire: `iterative`, `vit`, or `both`. Default `both`. Use `iterative` to skip the ViT op entirely (no engine load); use `vit` to skip the iterative DM/ML solver (no `live/`/`final/` Tiled writes). |
 | `vit_batch_writes` | bool | (Optional) Enable per-batch `pred` + `indices` writes to `<run>/vit/batches/NNNNNN/...` via `BatchWriterOp`. Default `false`. Each batch's `pred` is `(64, 2, 256, 256)` float32 (~33 MB) and a tiled HTTPS PUT runs at ~1 MB/s, so enabling this gates the whole ViT branch at ~28 s/batch. Leave off for live mosaic viewing; turn on only when offline analysts need the raw per-batch arrays. |
@@ -795,6 +798,14 @@ cuDeviceGet failed: invalid device ordinal` from `PtychoViTInferenceOp` during
 replay because the ViT branch was hard-coded to `gpu=1`. Fixed builds fall back
 to GPU 0 when only one configured GPU is available.
 
+On single-GPU nodes with `recon_mode='vit'`, older builds crash with `rc=-6`
+(SIGABRT) immediately after auto-centering. Root cause: `PtychoRecon.__init__`
+called `gpu_setup()` unconditionally, creating a CuPy CUDA context on GPU 0
+even in vit-only mode. When `PtychoViTInferenceOp` then opened a PyCUDA context
+on the same GPU from a different thread, the two contexts clashed. Fixed by
+guarding `PtychoRecon` instantiation behind `recon_mode in ("iterative", "both")`
+and computing pixel sizes directly from config params in the vit-only path.
+
 If replay publishes successfully but `hp status` reports an error like
 `New scan dimensions (...x...) exceed pre-allocated maximum (...x...)`, the
 failure is in `holoptycho.streaming_recon.StreamingPtychoRecon.gpu_setup()`.
@@ -830,6 +841,23 @@ from `PtychoViTInferenceOp`, the chunking loop is misbehaving — check that
   sync. The pipeline then sits with `positions_um` stuck at NaN and the
   dashboard hangs. Kill any running replay (`pkill -f replay_from_tiled`)
   before launching a new one.
+
+* **`--no-hp-start` now polls for pipeline readiness.** Older versions started
+  publishing immediately, racing against the ZMQ SUB connection and dropping
+  the first N frames — causing `FrameWriterOp: first batch starts at scan
+  frame N, expected 0` and aborting the run. The replay script now calls
+  `_wait_for_pipeline_ready()` in the `--no-hp-start` path, which polls
+  `GET /status` until `pipeline_ready: true` before publishing. The same
+  readiness gate (`_pipeline_ready` event → sentinel file → `/run` unblocks)
+  is used by `--hp-start` (server-side blocking); `--no-hp-start` mirrors it
+  client-side.
+
+  In the `--hp-start` path, the replay script now also binds the Eiger PUB
+  socket **before** calling `/run` or `/restart`. This ensures
+  `EigerZmqRxOp.connect()` (which fires during `compose()`) finds a live
+  endpoint and the ZMQ SUBSCRIBE handshake completes during the startup
+  window — before any frames are published. This eliminates the slow-joiner
+  race entirely for the `--hp-start` path, which is the default.
 
 * **`panda_upsample` (config field, default 1) — raw encoder samples per
   detector frame.** `PointProcessorOp` averages each group of this many raw

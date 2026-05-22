@@ -233,10 +233,10 @@ def lookup_uid_by_scan_id(tiled_url: str, scan_id) -> str:
     root_url = urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
     root = open_tiled_node(root_url)
     try:
-        catalog = root["hxn"]["raw"]
+        catalog = root["hxn"]["migration"]
     except KeyError:
         print(
-            f"ERROR: tiled server at {root_url} has no hxn/raw catalog",
+            f"ERROR: tiled server at {root_url} has no hxn/migration catalog",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -250,11 +250,12 @@ def lookup_uid_by_scan_id(tiled_url: str, scan_id) -> str:
         )
         sys.exit(1)
 
-    results = catalog.search(Eq("scan_id", scan_id_int))
+    results = catalog.search(Eq("start.scan_id", scan_id_int))
     uids = list(results)
+    print ("DEBUG: Length of uids is ", len(uids), file=sys.stderr)
     if not uids:
         print(
-            f"ERROR: no run in hxn/raw with scan_id={scan_id_int}",
+            f"ERROR: no run in hxn/migration with scan_id={scan_id_int}",
             file=sys.stderr,
         )
         sys.exit(1)

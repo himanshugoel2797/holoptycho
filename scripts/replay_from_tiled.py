@@ -127,6 +127,7 @@ def publish_eiger(
     client_public_key: str,
     rate_hz: float,
     no_compress: bool = False,
+    prebound_socket=None,
 ):
     """Publish Eiger frames over a ZMQ PUB socket.
 
@@ -159,42 +160,50 @@ def publish_eiger(
         than the chunk fetch rate, which reintroduced the SUB-side dead
         zones we already chased down.
     """
-    context = zmq.Context()
-    socket = context.socket(zmq.PUB)
-    # Bump send HWM well above the default 1000 so the publisher can dump
-    # a fetched chunk into ZMQ in one burst without waiting for the
-    # subscriber to drain. At ~128 KB per Eiger frame, 20000 = ~2.6 GB
-    # peak in the kernel/zmq buffers — comfortable for a dev box and
-    # enough to hold a full HXN scan (10000 frames) with margin. Above
-    # SNDHWM, frames get dropped at the PUB side, which is at least
-    # predictable (and visible to the subscriber via missing frame_id
-    # gaps) — far better than the silent stalls we had with rate-pacing
-    # racing tiled fetch latency.
-    socket.setsockopt(zmq.SNDHWM, 20000)
+    if prebound_socket is not None:
+        # Caller bound the socket before starting the pipeline so the SUB
+        # could connect during compose(). Use it directly — no bind/sleep needed.
+        socket = prebound_socket
+        context = None
+        _own_socket = False
+    else:
+        context = zmq.Context()
+        socket = context.socket(zmq.PUB)
+        # Bump send HWM well above the default 1000 so the publisher can dump
+        # a fetched chunk into ZMQ in one burst without waiting for the
+        # subscriber to drain. At ~128 KB per Eiger frame, 20000 = ~2.6 GB
+        # peak in the kernel/zmq buffers — comfortable for a dev box and
+        # enough to hold a full HXN scan (10000 frames) with margin. Above
+        # SNDHWM, frames get dropped at the PUB side, which is at least
+        # predictable (and visible to the subscriber via missing frame_id
+        # gaps) — far better than the silent stalls we had with rate-pacing
+        # racing tiled fetch latency.
+        socket.setsockopt(zmq.SNDHWM, 20000)
 
-    auth_values = {
-        "SERVER_PUBLIC_KEY": server_public_key,
-        "SERVER_SECRET_KEY": server_secret_key,
-        "CLIENT_PUBLIC_KEY": client_public_key,
-    }
-    configured = {name: value for name, value in auth_values.items() if value}
+        auth_values = {
+            "SERVER_PUBLIC_KEY": server_public_key,
+            "SERVER_SECRET_KEY": server_secret_key,
+            "CLIENT_PUBLIC_KEY": client_public_key,
+        }
+        configured = {name: value for name, value in auth_values.items() if value}
 
-    if configured and len(configured) != len(auth_values):
-        missing = [name for name, value in auth_values.items() if not value]
-        raise RuntimeError(
-            "Incomplete Eiger ZMQ auth configuration; set all of "
-            f"{', '.join(auth_values)} or leave them all unset. Missing: {', '.join(missing)}"
-        )
+        if configured and len(configured) != len(auth_values):
+            missing = [name for name, value in auth_values.items() if not value]
+            raise RuntimeError(
+                "Incomplete Eiger ZMQ auth configuration; set all of "
+                f"{', '.join(auth_values)} or leave them all unset. Missing: {', '.join(missing)}"
+            )
 
-    if len(configured) == len(auth_values):
-        socket.curve_publickey = server_public_key.encode("ascii")
-        socket.curve_secretkey = server_secret_key.encode("ascii")
-        socket.curve_server = True
+        if len(configured) == len(auth_values):
+            socket.curve_publickey = server_public_key.encode("ascii")
+            socket.curve_secretkey = server_secret_key.encode("ascii")
+            socket.curve_server = True
 
-    socket.bind(endpoint)
+        socket.bind(endpoint)
 
-    # Brief pause to let subscribers connect
-    time.sleep(0.5)
+        # Brief pause to let subscribers connect
+        time.sleep(0.5)
+        _own_socket = True
 
     encoding = _eiger_encoding_msg(frame_shape, frame_dtype, no_compress=no_compress)
 
@@ -243,8 +252,9 @@ def publish_eiger(
                 diag_pre_chunk_block_ms = 0.0
 
     print("[eiger] done", flush=True)
-    socket.close()
-    context.term()
+    if _own_socket:
+        socket.close()
+        context.term()
 
 
 def publish_panda(
@@ -616,6 +626,51 @@ def _json_request(
         raise RuntimeError(f"failed to reach holoptycho API at {url}: {exc.reason}") from exc
 
 
+def _wait_for_pipeline_ready(hp_url: str, timeout: float = 60.0) -> None:
+    """Poll /status until pipeline_ready is True or the timeout expires.
+
+    Used by --no-hp-start to ensure the ZMQ SUB is live before publishing.
+    /run and /restart already block server-side until ready, so this is only
+    needed in the --no-hp-start path where the caller started the pipeline
+    out-of-band (e.g. 'hp start') and hands control back to the replay script.
+    """
+    deadline = time.monotonic() + timeout
+    interval = 0.5
+    while True:
+        try:
+            status = _json_request(f"{hp_url}/status", timeout=5)
+        except RuntimeError as exc:
+            print(f"[holoptycho] warning: could not reach API while waiting for readiness: {exc}", flush=True)
+            status = {}
+        pipeline_status = status.get("status", "unknown")
+        if status.get("pipeline_ready"):
+            print(f"[holoptycho] pipeline ready (status={pipeline_status!r})", flush=True)
+            return
+        if pipeline_status in ("stopped", "finished"):
+            raise RuntimeError(
+                f"holoptycho pipeline is in status {pipeline_status!r} — start it with "
+                "'hp start' or 'hp restart' before running replay."
+            )
+        if pipeline_status == "error":
+            raise RuntimeError(
+                f"holoptycho pipeline reported an error: {status.get('error')!r}. "
+                "Check 'hp logs' for details."
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                f"Timed out waiting for pipeline to become ready after {timeout:.0f} s "
+                f"(last status={pipeline_status!r}). "
+                "Is holoptycho running? Start it with 'hp start' first."
+            )
+        print(
+            f"[holoptycho] waiting for pipeline ready (status={pipeline_status!r}, "
+            f"{remaining:.0f}s remaining) …",
+            flush=True,
+        )
+        time.sleep(interval)
+
+
 def start_holoptycho_pipeline(args, panda_upsample: int = 1) -> None:
     """Start or restart the holoptycho pipeline with config from the same run."""
     hp_url = args.hp_url.rstrip("/")
@@ -671,7 +726,7 @@ def parse_args():
         "--scan-id",
         type=int,
         default=None,
-        help="Bluesky scan_id (integer). Resolved to a UID via tiled search of hxn/raw; "
+        help="Bluesky scan_id (integer). Resolved to a UID via tiled search of hxn/migration; "
              "if multiple runs share the scan_id the newest by start.time is used.",
     )
     parser.add_argument(
@@ -866,7 +921,25 @@ def main():
         )
 
     if args.hp_start:
+        # Bind the Eiger PUB socket NOW — before starting the pipeline — so
+        # that EigerZmqRxOp.connect() (which fires during compose()) finds a
+        # live endpoint. The ZMQ handshake completes during the startup window
+        # while /run blocks waiting for pipeline_ready. Publishing only starts
+        # after /run returns 200, by which time the subscription is fully
+        # established and no frames are dropped.
+        eiger_ctx = zmq.Context()
+        eiger_sock = eiger_ctx.socket(zmq.PUB)
+        eiger_sock.setsockopt(zmq.SNDHWM, 20000)
+        eiger_sock.bind(args.eiger_endpoint)
+        print(f"[eiger] pre-bound PUB on {args.eiger_endpoint} (before hp start)", flush=True)
         start_holoptycho_pipeline(args, panda_upsample=streams["panda_upsample"])
+    else:
+        eiger_ctx = None
+        eiger_sock = None
+        # --no-hp-start: pipeline was started out-of-band. Still wait for the
+        # ZMQ SUB to be live before publishing — otherwise the slow-joiner race
+        # drops the first N frames and FrameWriterOp aborts on frame 0 check.
+        _wait_for_pipeline_ready(args.hp_url)
 
     # Run Eiger and PandA publishers concurrently. The Eiger thread pulls
     # chunks from tiled lazily — first chunk is the already-fetched head,
@@ -885,6 +958,7 @@ def main():
             args.eiger_client_public_key,
             args.rate,
             not args.compress,
+            eiger_sock,  # pre-bound socket, or None for --no-hp-start
         ),
         name="eiger-publisher",
     )
@@ -906,6 +980,9 @@ def main():
 
     eiger_thread.join()
     panda_thread.join()
+
+    if eiger_ctx is not None:
+        eiger_ctx.term()
 
     print("Replay complete.", flush=True)
 
